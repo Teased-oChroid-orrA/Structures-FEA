@@ -1,0 +1,33 @@
+.DS_Store
+.playwright-cli/
+
+# Root-local artifacts
+output/
+outputs/
+
+# Node
+node_modules/
+**/node_modules/
+
+# Build caches and outputs
+**/.svelte-kit/
+**/build/
+**/dist/
+**/.vite/
+
+# Rust
+**/target/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
