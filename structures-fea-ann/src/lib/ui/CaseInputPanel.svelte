@@ -73,5 +73,47 @@
         <option value="tet4">tet4</option>
       </select>
     </label>
+    <label class="field">
+      <span>Mesh NX</span>
+      <input type="number" bind:value={solveInput.mesh.nx} min="1" step="1" />
+    </label>
+    <label class="field">
+      <span>Mesh NY</span>
+      <input type="number" bind:value={solveInput.mesh.ny} min="1" step="1" />
+    </label>
+    <label class="field">
+      <span>Mesh NZ</span>
+      <input type="number" bind:value={solveInput.mesh.nz} min="1" step="1" />
+    </label>
+    <label class="field">
+      <span>Auto Mesh Adapt</span>
+      <select bind:value={solveInput.mesh.autoAdapt}>
+        <option value={true}>true</option>
+        <option value={false}>false</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Max DOFs</span>
+      <input type="number" bind:value={solveInput.mesh.maxDofs} min="300" step="100" />
+    </label>
+    <label class="field">
+      <span>AMR Enabled</span>
+      <select bind:value={solveInput.mesh.amrEnabled}>
+        <option value={true}>true</option>
+        <option value={false}>false</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>AMR Passes</span>
+      <input type="number" bind:value={solveInput.mesh.amrPasses} min="0" step="1" />
+    </label>
+    <label class="field">
+      <span>AMR Max NX</span>
+      <input type="number" bind:value={solveInput.mesh.amrMaxNx} min="2" step="1" />
+    </label>
+    <label class="field">
+      <span>AMR Refine Ratio</span>
+      <input type="number" bind:value={solveInput.mesh.amrRefineRatio} min="1" step="0.05" />
+    </label>
   </div>
 </div>

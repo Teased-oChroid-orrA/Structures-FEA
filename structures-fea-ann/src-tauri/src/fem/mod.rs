@@ -14,13 +14,90 @@ struct HexElement {
 }
 
 pub fn solve_case(input: &SolveInput) -> FemResult {
-    let g = &input.geometry;
-    let m = &input.material;
     let mesh = &input.mesh;
 
-    let nx = mesh.nx.max(1);
-    let ny = mesh.ny.max(1);
-    let nz = mesh.nz.max(1);
+    let mut nx = mesh.nx.max(1);
+    let mut ny = mesh.ny.max(1);
+    let mut nz = mesh.nz.max(1);
+
+    let mut diagnostics = Vec::new();
+    if mesh.auto_adapt {
+        let target_dofs = mesh.max_dofs.max(300);
+        let mut est_dofs = (nx + 1) * (ny + 1) * (nz + 1) * 3;
+        if est_dofs > target_dofs {
+            let scale = ((target_dofs as f64) / (est_dofs as f64)).cbrt().clamp(0.2, 1.0);
+            nx = ((nx as f64) * scale).round().max(1.0) as usize;
+            ny = ((ny as f64) * scale).round().max(1.0) as usize;
+            nz = ((nz as f64) * scale).round().max(1.0) as usize;
+            est_dofs = (nx + 1) * (ny + 1) * (nz + 1) * 3;
+            diagnostics.push(format!(
+                "Auto mesh adapt enabled: reduced mesh to nx={}, ny={}, nz={} to target <= {} DOFs (actual {}).",
+                nx, ny, nz, target_dofs, est_dofs
+            ));
+        } else {
+            diagnostics.push(format!(
+                "Auto mesh adapt enabled: requested mesh retained (estimated DOFs {}).",
+                est_dofs
+            ));
+        }
+    }
+
+    let mut amr_notes = Vec::new();
+    if mesh.amr_enabled && mesh.amr_passes > 0 {
+        let max_nx = mesh.amr_max_nx.max(nx);
+        let trigger = mesh.amr_refine_ratio.max(1.0);
+        for pass in 0..mesh.amr_passes {
+            let probe = solve_case_fixed(input, nx, ny, nz, Vec::new());
+            let (ratio, max_g, mean_g) = stress_gradient_ratio(&probe.beam_stations);
+            if ratio < trigger {
+                amr_notes.push(format!(
+                    "AMR pass {}: convergence reached (gradient ratio {:.3} < trigger {:.3}).",
+                    pass + 1,
+                    ratio,
+                    trigger
+                ));
+                break;
+            }
+            let next_nx = ((nx as f64) * 1.35).ceil() as usize;
+            let refined_nx = next_nx.max(nx + 1).min(max_nx);
+            if refined_nx <= nx {
+                amr_notes.push(format!(
+                    "AMR pass {}: reached AMR max NX {} (ratio {:.3}, max grad {:.3e}, mean grad {:.3e}).",
+                    pass + 1,
+                    max_nx,
+                    ratio,
+                    max_g,
+                    mean_g
+                ));
+                break;
+            }
+            amr_notes.push(format!(
+                "AMR pass {}: stress-gradient ratio {:.3} (max {:.3e}, mean {:.3e}) -> refining NX {} -> {}.",
+                pass + 1,
+                ratio,
+                max_g,
+                mean_g,
+                nx,
+                refined_nx
+            ));
+            nx = refined_nx;
+        }
+    }
+
+    let mut result = solve_case_fixed(input, nx, ny, nz, diagnostics);
+    result.diagnostics.extend(amr_notes);
+    result
+}
+
+fn solve_case_fixed(
+    input: &SolveInput,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    mut diagnostics: Vec<String>,
+) -> FemResult {
+    let g = &input.geometry;
+    let m = &input.material;
 
     let hx = g.length_in / nx as f64;
     let hy = g.width_in / ny as f64;
@@ -109,7 +186,7 @@ pub fn solve_case(input: &SolveInput) -> FemResult {
 
     let beam_stations = build_beam_stations(&nodes, &nodal_displacements, &nodal_sigma_x, &nodal_counts, nx);
 
-    FemResult {
+    let mut result = FemResult {
         nodal_displacements,
         strain_tensor,
         stress_tensor,
@@ -123,13 +200,38 @@ pub fn solve_case(input: &SolveInput) -> FemResult {
         force_vector: f_global.iter().take(64).copied().collect(),
         displacement_vector: vec![0.0, u_global[load_dof]],
         beam_stations,
-        diagnostics: vec![
-            format!("3D HEX assembly complete: nodes={}, elements={}, dof={}", nodes.len(), elements.len(), ndof),
-            format!("Point load applied at node {} (dof {}).", load_node, load_dof),
-            "BC elimination applied on left fixed face DOFs.".to_string(),
-            "Stress recovered at Gauss points and averaged to nodes for post-processing.".to_string(),
-        ],
+        diagnostics: Vec::new(),
+    };
+
+    diagnostics.push(format!(
+        "3D HEX assembly complete: nodes={}, elements={}, dof={}",
+        nodes.len(),
+        elements.len(),
+        ndof
+    ));
+    diagnostics.push(format!("Point load applied at node {} (dof {}).", load_node, load_dof));
+    diagnostics.push("BC elimination applied on left fixed face DOFs.".to_string());
+    diagnostics.push("Stress recovered at Gauss points and averaged to nodes for post-processing.".to_string());
+    result.diagnostics = diagnostics;
+    result
+}
+
+fn stress_gradient_ratio(stations: &[BeamStationResult]) -> (f64, f64, f64) {
+    if stations.len() < 2 {
+        return (1.0, 0.0, 0.0);
     }
+    let mut grads = Vec::with_capacity(stations.len() - 1);
+    for i in 0..stations.len() - 1 {
+        let dx = (stations[i + 1].x_in - stations[i].x_in).abs().max(1e-9);
+        let g = ((stations[i + 1].sigma_top_psi - stations[i].sigma_top_psi).abs()) / dx;
+        grads.push(g);
+    }
+    let mean = grads.iter().sum::<f64>() / grads.len() as f64;
+    let max = grads.iter().copied().fold(0.0_f64, f64::max);
+    if mean <= 1e-12 {
+        return (1.0, max, mean);
+    }
+    (max / mean, max, mean)
 }
 
 pub fn ann_features(input: &SolveInput) -> Vec<f64> {

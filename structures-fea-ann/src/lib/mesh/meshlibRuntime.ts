@@ -33,10 +33,13 @@ export async function warmupMeshLib(): Promise<MeshLibStatus> {
       return cached;
     }
 
-    const mod = await import('@alpinebuster/meshlib');
-    const create = (mod as any).createMeshLib ?? (mod as any).default;
+    const create = (window as any).MeshLib?.createMeshLib;
     if (typeof create !== 'function') {
-      cached = { ready: false, detail: 'MeshLib loaded but initializer not found.' };
+      cached = {
+        ready: false,
+        detail:
+          'MeshLib runtime bridge not present in window scope. Using internal meshing kernels.'
+      };
       return cached;
     }
 

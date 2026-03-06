@@ -14,7 +14,9 @@ import type {
   ThermalResult,
   TrainResult,
   TrainingBatch,
-  TrainingProgressEvent
+  TrainingProgressEvent,
+  TrainingRunStatus,
+  TrainingTickEvent
 } from '$lib/types/contracts';
 
 const isTauriRuntime = () =>
@@ -38,6 +40,21 @@ const mockState: MockState = {
   trainSamples: 0,
   auditFrequency: 5,
   fallbackEnabled: true
+};
+
+let lastMockTick: TrainingTickEvent = {
+  epoch: 0,
+  totalEpochs: 0,
+  loss: 0,
+  valLoss: 0,
+  learningRate: mockState.learningRate,
+  architecture: [...mockState.architecture],
+  progressRatio: 0
+};
+let mockTrainingStatus: TrainingRunStatus = {
+  running: false,
+  stopRequested: false,
+  completed: false
 };
 
 const emitMock = (name: string, payload: unknown) => {
@@ -137,8 +154,8 @@ export const solveFemCase = (input: SolveInput) => {
   return Promise.resolve(solveLocal(input));
 };
 
-export const trainAnn = async (batch: TrainingBatch) => {
-  if (isTauriRuntime()) return invoke<TrainResult>('train_ann', { batch });
+const runMockTrainingLoop = async (batch: TrainingBatch) => {
+  if (mockTrainingStatus.running) return false;
 
   const epochs = Math.max(1, batch.epochs);
   const maxTotal = Math.max(epochs, batch.maxTotalEpochs ?? epochs * 20);
@@ -150,8 +167,13 @@ export const trainAnn = async (batch: TrainingBatch) => {
   let completed = 0;
   let grew = false;
   let pruned = false;
+  mockTrainingStatus = {
+    running: true,
+    stopRequested: false,
+    completed: false
+  };
 
-  while (completed < maxTotal && valLoss > target) {
+  while (completed < maxTotal && valLoss > target && !mockTrainingStatus.stopRequested) {
     completed += 1;
     loss = Math.max(target * 0.5, loss * (0.965 + Math.random() * 0.02));
     valLoss = Math.max(target * 0.6, loss * (0.99 + Math.random() * 0.02));
@@ -177,6 +199,17 @@ export const trainAnn = async (batch: TrainingBatch) => {
       progressRatio: completed / maxTotal,
       network: networkSnapshot()
     };
+    const tick: TrainingTickEvent = {
+      epoch: completed,
+      totalEpochs: maxTotal,
+      loss,
+      valLoss,
+      learningRate: mockState.learningRate,
+      architecture: [...mockState.architecture],
+      progressRatio: completed / maxTotal
+    };
+    lastMockTick = tick;
+    emitMock('ann-training-tick', tick);
     emitMock('ann-training-progress', progress);
     await new Promise((r) => setTimeout(r, 10));
   }
@@ -194,11 +227,47 @@ export const trainAnn = async (batch: TrainingBatch) => {
     pruned,
     completedEpochs: completed,
     reachedTarget: valLoss <= target,
-    stopReason: valLoss <= target ? 'target-loss-reached' : 'max-epochs-reached',
+    stopReason: mockTrainingStatus.stopRequested
+      ? 'manual-stop'
+      : valLoss <= target
+        ? 'target-loss-reached'
+        : 'max-epochs-reached',
     notes: ['Web preview mode: local mock trainer active.']
   };
+  mockTrainingStatus = {
+    running: false,
+    stopRequested: false,
+    completed: true,
+    lastResult: result
+  };
   emitMock('ann-training-complete', result);
-  return result;
+  return true;
+};
+
+export const startAnnTraining = async (batch: TrainingBatch) => {
+  if (isTauriRuntime()) return invoke<boolean>('start_ann_training', { batch });
+  return runMockTrainingLoop(batch);
+};
+
+export const stopAnnTraining = async () => {
+  if (isTauriRuntime()) return invoke<boolean>('stop_ann_training');
+  if (mockTrainingStatus.running) {
+    mockTrainingStatus = { ...mockTrainingStatus, stopRequested: true };
+    return true;
+  }
+  return false;
+};
+
+export const getTrainingStatus = () => {
+  if (isTauriRuntime()) return invoke<TrainingRunStatus>('get_training_status');
+  return Promise.resolve(mockTrainingStatus);
+};
+
+export const trainAnn = async (batch: TrainingBatch) => {
+  if (isTauriRuntime()) return invoke<TrainResult>('train_ann', { batch });
+  await runMockTrainingLoop(batch);
+  if (mockTrainingStatus.lastResult) return mockTrainingStatus.lastResult;
+  throw new Error(mockTrainingStatus.lastError ?? 'Training ended without a result');
 };
 
 export const inferAnn = async (input: SolveInput) => {
@@ -274,6 +343,11 @@ export const getModelStatus = () => {
     auditFrequency: mockState.auditFrequency,
     fallbackEnabled: mockState.fallbackEnabled
   });
+};
+
+export const getTrainingTick = () => {
+  if (isTauriRuntime()) return invoke<TrainingTickEvent>('get_training_tick');
+  return Promise.resolve(lastMockTick);
 };
 
 export const exportReport = (input: ReportInput) => {

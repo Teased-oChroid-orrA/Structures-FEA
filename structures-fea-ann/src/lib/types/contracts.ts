@@ -9,6 +9,12 @@ export type MeshControls = {
   ny: number;
   nz: number;
   elementType: string;
+  autoAdapt: boolean;
+  maxDofs: number;
+  amrEnabled: boolean;
+  amrPasses: number;
+  amrMaxNx: number;
+  amrRefineRatio: number;
 };
 
 export type BoundaryConditionInput = {
@@ -167,6 +173,24 @@ export type TrainingProgressEvent = {
   network: NetworkSnapshot;
 };
 
+export type TrainingTickEvent = {
+  epoch: number;
+  totalEpochs: number;
+  loss: number;
+  valLoss: number;
+  learningRate: number;
+  architecture: number[];
+  progressRatio: number;
+};
+
+export type TrainingRunStatus = {
+  running: boolean;
+  stopRequested: boolean;
+  completed: boolean;
+  lastResult?: TrainResult;
+  lastError?: string;
+};
+
 export type TrainResult = {
   modelVersion: number;
   loss: number;
@@ -227,7 +251,13 @@ export const defaultSolveInput: SolveInput = {
     nx: 10,
     ny: 4,
     nz: 1,
-    elementType: 'hex8'
+    elementType: 'hex8',
+    autoAdapt: true,
+    maxDofs: 12000,
+    amrEnabled: true,
+    amrPasses: 2,
+    amrMaxNx: 28,
+    amrRefineRatio: 1.2
   },
   material: {
     ePsi: 10_000_000,

@@ -15,6 +15,38 @@ pub struct MeshControls {
     pub ny: usize,
     pub nz: usize,
     pub element_type: String,
+    #[serde(default = "default_true")]
+    pub auto_adapt: bool,
+    #[serde(default = "default_max_dofs")]
+    pub max_dofs: usize,
+    #[serde(default = "default_true")]
+    pub amr_enabled: bool,
+    #[serde(default = "default_amr_passes")]
+    pub amr_passes: usize,
+    #[serde(default = "default_amr_max_nx")]
+    pub amr_max_nx: usize,
+    #[serde(default = "default_amr_refine_ratio")]
+    pub amr_refine_ratio: f64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_dofs() -> usize {
+    12_000
+}
+
+fn default_amr_passes() -> usize {
+    2
+}
+
+fn default_amr_max_nx() -> usize {
+    28
+}
+
+fn default_amr_refine_ratio() -> f64 {
+    1.2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +110,12 @@ impl Default for SolveInput {
                 ny: 4,
                 nz: 1,
                 element_type: "hex8".to_string(),
+                auto_adapt: true,
+                max_dofs: 12_000,
+                amr_enabled: true,
+                amr_passes: 2,
+                amr_max_nx: 28,
+                amr_refine_ratio: 1.2,
             },
             material: Material::default(),
             boundary_conditions: BoundaryConditionInput {
@@ -248,6 +286,28 @@ pub struct TrainingProgressEvent {
     pub architecture: Vec<usize>,
     pub progress_ratio: f64,
     pub network: NetworkSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingTickEvent {
+    pub epoch: usize,
+    pub total_epochs: usize,
+    pub loss: f64,
+    pub val_loss: f64,
+    pub learning_rate: f64,
+    pub architecture: Vec<usize>,
+    pub progress_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingRunStatus {
+    pub running: bool,
+    pub stop_requested: bool,
+    pub completed: bool,
+    pub last_result: Option<TrainResult>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

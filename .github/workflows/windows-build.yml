@@ -31,6 +31,16 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Frontend type/lint checks
+        run: npm run check
+
+      - name: Frontend production build
+        run: npm run build
+
+      - name: Rust compile checks
+        run: cargo check
+        working-directory: structures-fea-ann/src-tauri
+
       - name: Build desktop app (Tauri)
         run: npm run tauri:build
 

@@ -7,22 +7,27 @@
   import { warmupMeshLib } from '$lib/mesh/meshlibRuntime';
   import {
     solveFemCase,
-    trainAnn,
+    startAnnTraining,
+    stopAnnTraining,
+    getTrainingStatus,
     inferAnn,
     runDynamicCase,
     runThermalCase,
     evaluateFailure,
     getModelStatus,
+    getTrainingTick,
     exportReport
   } from '$lib/api/commands';
   import { defaultSolveInput } from '$lib/types/contracts';
   import type {
     DynamicInput,
     TrainingBatch,
+    TrainingRunStatus,
     ThermalInput,
     ReportInput,
     FemResult,
     FailureResult,
+    TrainingTickEvent,
     TrainingProgressEvent,
     TrainResult
   } from '$lib/types/contracts';
@@ -41,9 +46,15 @@
   let startupStage = $state('Booting compute core...');
   let startupDetail = $state('');
   let trainingActive = $state(false);
+  let trainingTick = $state<TrainingTickEvent | null>(null);
   let trainingProgress = $state<TrainingProgressEvent | null>(null);
   let trainingHistory = $state<TrainingProgressEvent[]>([]);
   let lastTrainResult = $state<TrainResult | null>(null);
+  let trainingStatus = $state<TrainingRunStatus | null>(null);
+  let trainingElapsedMs = $state(0);
+  let trainingStartMs = $state<number | null>(null);
+  let isTauriRuntimeClient = $state(false);
+  let lastEpochRate = $state(0);
 
   let thermalDelta = $state(40);
   let thermalRestrainedX = $state('true');
@@ -65,9 +76,110 @@
 
   const hasAnyResult = $derived(Boolean(femResult || annResult || thermalResult || dynamicResult || failureResult));
   const startupPercent = $derived(Math.round(startupProgress * 100));
+  const trainingElapsedS = $derived(trainingElapsedMs / 1000);
+  const estimatedEpoch = $derived.by(() => {
+    if (!trainingActive) return trainingTick?.epoch ?? 0;
+    if (trainingTick && trainingTick.epoch > 0) return trainingTick.epoch;
+    const fallbackRate = lastEpochRate > 0 ? lastEpochRate : Math.max(4, trainEpochs * 0.75);
+    return Math.min(trainMaxEpochs, Math.max(1, Math.round(trainingElapsedS * fallbackRate)));
+  });
+  const displayTotalEpochs = $derived.by(() =>
+    trainingTick?.totalEpochs && trainingTick.totalEpochs > 0 ? trainingTick.totalEpochs : trainMaxEpochs
+  );
+  const progressDisplayRatio = $derived.by(() => {
+    if (trainingTick && trainingTick.totalEpochs > 0) return Math.max(0, Math.min(1, trainingTick.progressRatio));
+    if (trainingActive && displayTotalEpochs > 0) {
+      return Math.max(0, Math.min(1, estimatedEpoch / displayTotalEpochs));
+    }
+    if (!trainingActive) return 0;
+    return ((trainingElapsedMs / 1000) % 6) / 6;
+  });
+
+  $effect(() => {
+    if (!trainingActive) {
+      trainingElapsedMs = 0;
+      trainingStartMs = null;
+      return;
+    }
+    trainingStartMs = Date.now();
+    const id = setInterval(() => {
+      trainingElapsedMs = Date.now() - (trainingStartMs ?? Date.now());
+    }, 200);
+    return () => clearInterval(id);
+  });
+
+  $effect(() => {
+    if (!trainingActive || !isTauriRuntimeClient) return;
+    let stopped = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const tick = await getTrainingTick();
+        if (!stopped && tick && tick.epoch >= (trainingTick?.epoch ?? 0)) {
+          trainingTick = tick;
+        }
+      } catch {
+        // Best-effort polling fallback for runtimes that delay event delivery.
+      } finally {
+        inFlight = false;
+      }
+    };
+    const id = setInterval(poll, 300);
+    poll();
+    return () => {
+      stopped = true;
+      clearInterval(id);
+    };
+  });
+
+  $effect(() => {
+    if (!trainingActive) return;
+    let stopped = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const status = await getTrainingStatus();
+        if (stopped) return;
+        trainingStatus = status;
+        trainingActive = status.running;
+        if (!status.running) {
+          if (status.lastResult) {
+            lastTrainResult = status.lastResult;
+            trainingTick = {
+              epoch: status.lastResult.completedEpochs,
+              totalEpochs: Math.max(status.lastResult.completedEpochs, trainMaxEpochs),
+              loss: status.lastResult.loss,
+              valLoss: status.lastResult.valLoss,
+              learningRate: status.lastResult.learningRate,
+              architecture: status.lastResult.architecture,
+              progressRatio:
+                status.lastResult.completedEpochs /
+                Math.max(1, Math.max(status.lastResult.completedEpochs, trainMaxEpochs))
+            };
+            await onModelStatus();
+          } else if (status.lastError) {
+            err = status.lastError;
+          }
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    const id = setInterval(poll, 350);
+    poll();
+    return () => {
+      stopped = true;
+      clearInterval(id);
+    };
+  });
 
   onMount(() => {
     const isTauriRuntime = typeof window !== 'undefined' && typeof (window as any).__TAURI_INTERNALS__ !== 'undefined';
+    isTauriRuntimeClient = isTauriRuntime;
     let unlistenProgress: (() => void) | undefined;
     let unlistenComplete: (() => void) | undefined;
     let offProgressWeb: (() => void) | undefined;
@@ -82,36 +194,70 @@
       if (isTauriRuntime) {
         const { listen } = await import('@tauri-apps/api/event');
         unlistenProgress = await listen<TrainingProgressEvent>('ann-training-progress', (event) => {
-          trainingProgress = event.payload;
+          if (event.payload.network.layerSizes.length > 0) {
+            trainingProgress = event.payload;
+          } else if (trainingProgress) {
+            trainingProgress = { ...event.payload, network: trainingProgress.network };
+          }
           trainingHistory = [...trainingHistory.slice(-199), event.payload];
+        });
+        const unlistenTick = await listen<TrainingTickEvent>('ann-training-tick', (event) => {
+          trainingTick = event.payload;
         });
 
         unlistenComplete = await listen<TrainResult>('ann-training-complete', async (event) => {
           trainingActive = false;
           lastTrainResult = event.payload;
+          if (trainingElapsedS > 0 && event.payload.completedEpochs > 0) {
+            lastEpochRate = event.payload.completedEpochs / trainingElapsedS;
+          }
           await onModelStatus();
         });
+        const priorCleanup = unlistenComplete;
+        unlistenComplete = () => {
+          unlistenTick();
+          priorCleanup();
+        };
       } else if (typeof window !== 'undefined') {
+        const onTick = (event: Event) => {
+          const payload = (event as CustomEvent<TrainingTickEvent>).detail;
+          trainingTick = payload;
+        };
         const onProgress = (event: Event) => {
           const payload = (event as CustomEvent<TrainingProgressEvent>).detail;
-          trainingProgress = payload;
+          if (payload.network.layerSizes.length > 0) {
+            trainingProgress = payload;
+          } else if (trainingProgress) {
+            trainingProgress = { ...payload, network: trainingProgress.network };
+          }
           trainingHistory = [...trainingHistory.slice(-199), payload];
         };
         const onComplete = async (event: Event) => {
           const payload = (event as CustomEvent<TrainResult>).detail;
           trainingActive = false;
           lastTrainResult = payload;
+          if (trainingElapsedS > 0 && payload.completedEpochs > 0) {
+            lastEpochRate = payload.completedEpochs / trainingElapsedS;
+          }
           await onModelStatus();
         };
+        window.addEventListener('ann-training-tick', onTick as EventListener);
         window.addEventListener('ann-training-progress', onProgress as EventListener);
         window.addEventListener('ann-training-complete', onComplete as EventListener);
-        offProgressWeb = () => window.removeEventListener('ann-training-progress', onProgress as EventListener);
+        offProgressWeb = () => {
+          window.removeEventListener('ann-training-tick', onTick as EventListener);
+          window.removeEventListener('ann-training-progress', onProgress as EventListener);
+        };
         offCompleteWeb = () => window.removeEventListener('ann-training-complete', onComplete as EventListener);
       }
 
       startupStage = 'Loading model state...';
       startupProgress = 0.72;
       await onModelStatus();
+      trainingStatus = await call(() => getTrainingStatus());
+      if (trainingStatus?.running) {
+        trainingActive = true;
+      }
       await pause(100);
       startupStage = 'Warming MeshLib kernels...';
       startupProgress = 0.86;
@@ -149,6 +295,15 @@
 
   async function onTrainAnn() {
     trainingActive = true;
+    trainingTick = {
+      epoch: 0,
+      totalEpochs: Math.max(1, trainMaxEpochs),
+      loss: 0,
+      valLoss: 0,
+      learningRate: trainLr,
+      architecture: modelStatus?.architecture ?? [],
+      progressRatio: 0
+    };
     trainingHistory = [];
     trainingProgress = null;
     const batch: TrainingBatch = {
@@ -160,9 +315,18 @@
       maxTotalEpochs: trainMaxEpochs,
       minImprovement: trainMinImprovement
     };
-    const result = await call(() => trainAnn(batch));
-    if (!result) {
+    const started = await call(() => startAnnTraining(batch));
+    if (!started) {
       trainingActive = false;
+      err = 'Training is already running or failed to start.';
+    }
+  }
+
+  async function onStopTrain() {
+    const stopped = await call(() => stopAnnTraining());
+    if (!stopped) return;
+    if (trainingStatus) {
+      trainingStatus = { ...trainingStatus, stopRequested: true };
     }
   }
 
@@ -269,11 +433,44 @@
 
         <section class="panel stack">
           <h2>Solve Controls</h2>
+          <div class="stack" style="gap:0.45rem;">
+            <div style="display:flex;justify-content:space-between;gap:0.75rem;align-items:center;flex-wrap:wrap;">
+              <p>Training progress</p>
+              <div class="kicker">
+                <span class="chip">{trainingActive ? 'running' : 'idle'}</span>
+                {#if trainingStatus?.stopRequested}
+                  <span class="chip warn">stop requested</span>
+                {/if}
+                <span class="chip">
+                  <NumberFlow value={estimatedEpoch} format={{ maximumFractionDigits: 0 }} />
+                  /
+                  <NumberFlow value={displayTotalEpochs} format={{ maximumFractionDigits: 0 }} />
+                </span>
+                <span class="chip">
+                  loss:
+                  {#if trainingTick && trainingTick.valLoss > 0}
+                    <NumberFlow value={trainingTick.valLoss} format={{ maximumSignificantDigits: 4 }} />
+                  {:else if trainingActive}
+                    estimating...
+                  {:else}
+                    <NumberFlow value={0} format={{ maximumFractionDigits: 0 }} />
+                  {/if}
+                </span>
+                <span class="chip">elapsed: <NumberFlow value={trainingElapsedS} format={{ maximumFractionDigits: 1 }} />s</span>
+              </div>
+            </div>
+            <div class="startup-progress-track">
+              <div class="startup-progress-fill" style={`width:${Math.max(0, Math.min(100, progressDisplayRatio * 100))}%;`}></div>
+            </div>
+          </div>
           <div class="actions">
             <button class="btn-primary" onclick={onSolveFem}>Solve FEM Case</button>
             <button class="btn-secondary" onclick={onInferAnn}>Infer ANN</button>
             <button class="btn-secondary" onclick={onTrainAnn} disabled={trainingActive}>
               {trainingActive ? 'Training…' : 'Train ANN'}
+            </button>
+            <button class="btn-secondary" onclick={onStopTrain} disabled={!trainingActive || trainingStatus?.stopRequested}>
+              Stop Training
             </button>
             <button class="btn-secondary" onclick={onFailure}>Evaluate Failure</button>
             <button class="btn-secondary" onclick={onThermal}>Run Thermal Case</button>

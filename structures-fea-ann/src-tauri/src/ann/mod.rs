@@ -1,4 +1,5 @@
 use rand::Rng;
+use std::time::{Duration, Instant};
 
 use crate::contracts::{
     AnnResult, ModelStatus, NetworkConnectionSnapshot, NetworkNodeSnapshot, NetworkSnapshot,
@@ -71,9 +72,15 @@ impl AnnModel {
         }
     }
 
-    pub fn train_with_progress<F>(&mut self, batch: &TrainingBatch, mut on_epoch: F) -> TrainResult
+    pub fn train_with_progress<F, S>(
+        &mut self,
+        batch: &TrainingBatch,
+        mut on_epoch: F,
+        mut should_stop: S,
+    ) -> TrainResult
     where
         F: FnMut(TrainingProgressEvent),
+        S: FnMut() -> bool,
     {
         if let Some(lr) = batch.learning_rate {
             self.learning_rate = lr.clamp(1e-6, 1e-1);
@@ -111,7 +118,8 @@ impl AnnModel {
             .max_total_epochs
             .unwrap_or(cycle_epochs * 20)
             .clamp(1, 100_000_000);
-        let emit_stride = (max_total_epochs / 2000).clamp(1, 100);
+        let emit_stride = (max_total_epochs / 2000).clamp(1, 2000);
+        let snapshot_stride = (emit_stride * 25).clamp(1, 20_000);
         let min_improvement = batch.min_improvement.unwrap_or(1e-7).max(1e-12);
         let target_loss = batch.target_loss.max(0.0);
 
@@ -119,13 +127,26 @@ impl AnnModel {
         let mut val_loss = f64::MAX;
         let mut completed_epochs = 0usize;
         let mut reached_target = false;
+        let mut manual_stop = false;
         let mut prev_cycle_best = f64::MAX;
+        let mut last_emit = Instant::now();
+        let mut last_snapshot_emit = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .unwrap_or_else(Instant::now);
 
         while completed_epochs < max_total_epochs {
+            if should_stop() {
+                manual_stop = true;
+                break;
+            }
             let cycle_start_best = val_loss;
 
             for _ in 0..cycle_epochs {
                 if completed_epochs >= max_total_epochs {
+                    break;
+                }
+                if should_stop() {
+                    manual_stop = true;
                     break;
                 }
 
@@ -148,11 +169,18 @@ impl AnnModel {
                     self.learning_rate *= 0.5;
                 }
 
-                if completed_epochs == 1
+                let emit_due_to_epoch = completed_epochs == 1
                     || completed_epochs % emit_stride == 0
                     || completed_epochs >= max_total_epochs
-                    || (auto_mode && val_loss <= target_loss)
-                {
+                    || (auto_mode && val_loss <= target_loss);
+                let emit_due_to_time = last_emit.elapsed() >= Duration::from_millis(250);
+
+                if emit_due_to_epoch || emit_due_to_time {
+                    let include_snapshot = completed_epochs == 1
+                        || completed_epochs % snapshot_stride == 0
+                        || completed_epochs >= max_total_epochs
+                        || (auto_mode && val_loss <= target_loss)
+                        || last_snapshot_emit.elapsed() >= Duration::from_secs(2);
                     on_epoch(TrainingProgressEvent {
                         epoch: completed_epochs,
                         total_epochs: max_total_epochs,
@@ -161,8 +189,20 @@ impl AnnModel {
                         learning_rate: self.learning_rate,
                         architecture: self.layer_sizes.clone(),
                         progress_ratio: completed_epochs as f64 / max_total_epochs as f64,
-                        network: self.network_snapshot(),
+                        network: if include_snapshot {
+                            self.network_snapshot()
+                        } else {
+                            NetworkSnapshot {
+                                layer_sizes: vec![],
+                                nodes: vec![],
+                                connections: vec![],
+                            }
+                        },
                     });
+                    last_emit = Instant::now();
+                    if include_snapshot {
+                        last_snapshot_emit = Instant::now();
+                    }
                 }
 
                 if auto_mode && val_loss <= target_loss {
@@ -172,6 +212,10 @@ impl AnnModel {
             }
 
             if !auto_mode {
+                break;
+            }
+
+            if manual_stop {
                 break;
             }
 
@@ -243,6 +287,8 @@ impl AnnModel {
             reached_target,
             stop_reason: if reached_target {
                 "target-loss-reached".to_string()
+            } else if manual_stop {
+                "manual-stop".to_string()
             } else if completed_epochs >= max_total_epochs {
                 "max-epochs-reached".to_string()
             } else {
