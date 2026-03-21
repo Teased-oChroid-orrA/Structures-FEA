@@ -1,0 +1,6 @@
+{
+  "name": "cantilever-benchmark-lock",
+  "source": "scripts/run-benchmark-profile.sh",
+  "maxValLoss": 0.4,
+  "maxEpochs": 10000
+}

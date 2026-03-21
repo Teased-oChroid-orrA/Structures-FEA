@@ -1,0 +1,27 @@
+{
+  "name": "pino-release-signoff-lock",
+  "source": "scripts/run-pino-signoff-profile.sh",
+  "minThroughputEps": 5.0,
+  "maxInferLatencyMs": 50.0,
+  "maxMemoryEstimateMb": 32.0,
+  "requireResumeOk": 1,
+  "maxValLoss": 0.5,
+  "maxEpochs": 200,
+  "holdout": {
+    "cantilever": {
+      "maxMeanDisp": 2.5,
+      "maxMeanVm": 0.08,
+      "maxP95": 2.6
+    },
+    "axial": {
+      "maxMeanDisp": 1.1,
+      "maxMeanVm": 0.05,
+      "maxP95": 1.1
+    },
+    "plate-hole": {
+      "maxMeanDisp": 0.05,
+      "maxMeanVm": 0.05,
+      "maxP95": 0.05
+    }
+  }
+}

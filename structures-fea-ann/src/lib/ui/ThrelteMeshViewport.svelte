@@ -11,12 +11,23 @@
   let { nodalDisplacements }: Props = $props();
 
   let mounted = $state(false);
+  let webglAvailable = $state(false);
+  let webglDetail = $state('');
   let deformAmplification = $state(80);
   let hoveredNodeId = $state<number | null>(null);
   let selectedNodeId = $state<number | null>(null);
 
   onMount(() => {
     mounted = true;
+    const canvas = document.createElement('canvas');
+    const gl =
+      canvas.getContext('webgl2', { failIfMajorPerformanceCaveat: true }) ??
+      canvas.getContext('webgl', { failIfMajorPerformanceCaveat: true }) ??
+      canvas.getContext('experimental-webgl');
+    webglAvailable = Boolean(gl);
+    if (!webglAvailable) {
+      webglDetail = 'WebGL is unavailable in this runtime. Falling back to the 2D mesh and scalar views.';
+    }
   });
 
   const vmRange = $derived.by(() => {
@@ -70,7 +81,7 @@
   <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:0.8rem;flex-wrap:wrap;">
     <div class="stack" style="gap:0.35rem;">
       <h3>3D Mesh + Deflection View (Threlte)</h3>
-      <p>MeshLib-ready geometry state rendered declaratively with Threlte and interactive orbit controls.</p>
+      <p>Geometry state rendered declaratively with Threlte and interactive orbit controls.</p>
     </div>
     <div class="kicker">
       <span class="chip">amplification: {fmt(deformAmplification, 1)}x</span>
@@ -84,7 +95,7 @@
     <input type="range" min="1" max="260" step="1" bind:value={deformAmplification} />
   </label>
 
-  {#if mounted}
+  {#if mounted && webglAvailable}
     <div class="threlte-canvas">
       <Canvas dpr={1.5} renderMode="on-demand" colorManagementEnabled={true}>
         <T.PerspectiveCamera makeDefault position={[14, 9, 14]} fov={40} near={0.01} far={2000}>
@@ -122,6 +133,8 @@
         {/each}
       </Canvas>
     </div>
+  {:else if mounted}
+    <p>{webglDetail || 'WebGL is unavailable in this runtime. Falling back to the 2D mesh and scalar views.'}</p>
   {:else}
     <p>Preparing 3D scene...</p>
   {/if}

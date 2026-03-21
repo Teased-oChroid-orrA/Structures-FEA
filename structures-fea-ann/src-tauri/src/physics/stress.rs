@@ -9,7 +9,7 @@ pub fn von_mises(stress: [[f64; 3]; 3]) -> f64 {
     let txz = stress[0][2];
     (0.5 * ((sx - sy).powi(2) + (sy - sz).powi(2) + (sz - sx).powi(2))
         + 3.0 * (txy.powi(2) + tyz.powi(2) + txz.powi(2)))
-        .sqrt()
+    .sqrt()
 }
 
 pub fn principal_stresses(stress: [[f64; 3]; 3]) -> [f64; 3] {

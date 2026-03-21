@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   AnnResult,
+  CheckpointRetentionPolicy,
+  CheckpointSaveInput,
   DynamicInput,
   DynamicResult,
   ExportResult,
@@ -8,19 +10,39 @@ import type {
   FailureResult,
   FemResult,
   ModelStatus,
+  PurgeCheckpointsResult,
   ReportInput,
+  RuntimeFingerprint,
+  ResumeTrainingResult,
+  SafeguardSettings,
   SolveInput,
   ThermalInput,
   ThermalResult,
   TrainResult,
   TrainingBatch,
+  TrainingCheckpointInfo,
   TrainingProgressEvent,
   TrainingRunStatus,
   TrainingTickEvent
 } from '$lib/types/contracts';
 
 const isTauriRuntime = () =>
-  typeof window !== 'undefined' && typeof (window as any).__TAURI_INTERNALS__ !== 'undefined';
+  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+export const getRuntimeKind = () => (isTauriRuntime() ? 'tauri' : 'mock');
+
+export const getRuntimeFingerprint = () => {
+  if (isTauriRuntime()) return invoke<RuntimeFingerprint>('get_runtime_fingerprint');
+  return Promise.resolve({
+    appVersion: '0.1.0',
+    buildProfile: 'mock',
+    targetOs: (typeof navigator !== 'undefined' ? navigator.platform : 'unknown').toLowerCase(),
+    targetArch: 'unknown',
+    debugBuild: true,
+    gitCommit: 'mock',
+    buildTimeUtc: 'mock'
+  });
+};
 
 type MockState = {
   modelVersion: number;
@@ -34,7 +56,7 @@ type MockState = {
 
 const mockState: MockState = {
   modelVersion: 1,
-  architecture: [8, 12, 12, 6],
+  architecture: [19, 16, 16, 9],
   learningRate: 5e-4,
   lastLoss: 0.2,
   trainSamples: 0,
@@ -51,10 +73,108 @@ let lastMockTick: TrainingTickEvent = {
   architecture: [...mockState.architecture],
   progressRatio: 0
 };
+let lastMockProgress: TrainingProgressEvent = {
+  epoch: 0,
+  totalEpochs: 0,
+  loss: 0,
+  valLoss: 0,
+  dataLoss: 0,
+  physicsLoss: 0,
+  valDataLoss: 0,
+  valPhysicsLoss: 0,
+  momentumResidual: 0,
+  kinematicResidual: 0,
+  materialResidual: 0,
+  boundaryResidual: 0,
+  displacementFit: 0,
+  stressFit: 0,
+  invariantResidual: 0,
+  constitutiveNormalResidual: 0,
+  constitutiveShearResidual: 0,
+  valDisplacementFit: 0,
+  valStressFit: 0,
+  valInvariantResidual: 0,
+  valConstitutiveNormalResidual: 0,
+  valConstitutiveShearResidual: 0,
+  hybridMode: 'hybrid',
+  stageId: 'idle',
+  optimizerId: 'pino-adam',
+  lrPhase: 'idle',
+  targetBandLow: 0,
+  targetBandHigh: 0,
+  trendSlope: 0,
+  trendVariance: 0,
+  watchdogTriggerCount: 0,
+  collocationSamplesAdded: 0,
+  trainDataSize: 0,
+  trainDataCap: 0,
+  residualWeightMomentum: 1,
+  residualWeightKinematics: 1,
+  residualWeightMaterial: 1,
+  residualWeightBoundary: 1,
+  learningRate: mockState.learningRate,
+  architecture: [...mockState.architecture],
+  progressRatio: 0,
+  network: { layerSizes: [], nodes: [], connections: [] }
+};
 let mockTrainingStatus: TrainingRunStatus = {
   running: false,
   stopRequested: false,
-  completed: false
+  completed: false,
+  diagnostics: {
+    bestValLoss: Number.MAX_VALUE,
+    epochsSinceImprovement: 0,
+    lrSchedulePhase: 'idle',
+    currentLearningRate: mockState.learningRate,
+    dataWeight: 2,
+    physicsWeight: 2,
+    residualWeightMomentum: 1,
+    residualWeightKinematics: 1,
+    residualWeightMaterial: 1,
+    residualWeightBoundary: 1,
+    activeLearningRounds: 0,
+    activeLearningSamplesAdded: 0,
+    safeguardTriggers: 0,
+    curriculumBackoffs: 0,
+    optimizerSwitches: 0,
+    checkpointRollbacks: 0,
+    targetFloorEstimate: 0,
+    trendStopReason: 'idle',
+    activeStage: 'idle',
+    activeOptimizer: 'pino-adam',
+    boPresearchUsed: false,
+    boSelectedArchitecture: [...mockState.architecture],
+    momentumResidual: 0,
+    kinematicResidual: 0,
+    materialResidual: 0,
+    boundaryResidual: 0,
+    displacementFit: 0,
+    stressFit: 0,
+    invariantResidual: 0,
+    constitutiveNormalResidual: 0,
+    constitutiveShearResidual: 0,
+    valDisplacementFit: 0,
+    valStressFit: 0,
+    valInvariantResidual: 0,
+    valConstitutiveNormalResidual: 0,
+    valConstitutiveShearResidual: 0,
+    hybridMode: 'hybrid',
+    collocationPoints: 512,
+    boundaryPoints: 128,
+    interfacePoints: 128,
+    collocationSamplesAdded: 0,
+    trainDataSize: 0,
+    trainDataCap: 0,
+    recentEvents: []
+  }
+};
+
+const mockCheckpoints: TrainingCheckpointInfo[] = [];
+let mockSafeguardSettings: SafeguardSettings = {
+  preset: 'balanced',
+  uncertaintyThreshold: 0.26,
+  residualThreshold: 0.24,
+  adaptiveByGeometry: true
 };
 
 const emitMock = (name: string, payload: unknown) => {
@@ -67,23 +187,25 @@ const fmtStations = (input: SolveInput) => {
   const L = input.geometry.lengthIn;
   const W = input.geometry.widthIn;
   const t = input.geometry.thicknessIn;
-  const P = input.load.verticalPointLoadLbf;
-  const E = input.material.ePsi;
-  const I = (t * Math.pow(W, 3)) / 12;
-  const c = W / 2;
+  const P = input.load.axialLoadLbf;
+  const V = input.load.verticalPointLoadLbf;
+  const area = Math.max(1e-9, W * t);
+  const sigmaNom = P / area;
+  const i = Math.max(1e-9, (t * W ** 3) / 12);
+  const sigmaMax = V !== 0 ? sigmaNom + (V * L * 0.5 * W) / i : 3 * sigmaNom;
+  const spread = Math.max(0.12 * L, 1e-6);
   const n = Math.max(8, input.mesh.nx);
   return Array.from({ length: n + 1 }, (_, i) => {
     const x = (L * i) / n;
-    const M = P * (L - x);
-    const sigmaTop = (M * c) / I;
-    const defl = (P * x * x * (3 * L - x)) / (6 * E * I);
+    const bump = Math.exp(-Math.pow(x - L * 0.5, 2) / (2 * spread * spread));
+    const sigmaTop = sigmaNom + (sigmaMax - sigmaNom) * bump;
     return {
       xIn: x,
-      shearLbf: P,
-      momentLbIn: M,
+      shearLbf: 0,
+      momentLbIn: 0,
       sigmaTopPsi: sigmaTop,
       sigmaBottomPsi: -sigmaTop,
-      deflectionIn: defl
+      deflectionIn: 0
     };
   });
 };
@@ -92,22 +214,40 @@ const solveLocal = (input: SolveInput): FemResult => {
   const L = input.geometry.lengthIn;
   const W = input.geometry.widthIn;
   const t = input.geometry.thicknessIn;
-  const P = input.load.verticalPointLoadLbf;
+  const P = input.load.axialLoadLbf;
+  const V = input.load.verticalPointLoadLbf;
   const E = input.material.ePsi;
   const nu = input.material.nu;
-  const I = (t * Math.pow(W, 3)) / 12;
-  const c = W / 2;
-  const M0 = P * L;
-  const sigma = (M0 * c) / I;
+  const area = Math.max(1e-9, W * t);
+  const sigmaNom = P / area;
+  const i = Math.max(1e-9, (t * W ** 3) / 12);
+  const sigma = V !== 0 ? sigmaNom + (V * L * 0.5 * W) / i : 3 * sigmaNom;
   const eps = sigma / E;
-  const tip = (P * Math.pow(L, 3)) / (3 * E * I);
+  const tip = input.boundaryConditions.fixEndFace
+    ? 0
+    : V !== 0
+      ? (V * L ** 3) / (3 * E * i)
+      : (sigmaNom * L) / E;
   const vm = Math.abs(sigma);
-  const k = (3 * E * I) / Math.pow(L, 3);
+  const k = E * area / Math.max(1e-9, L);
+  const scf = sigmaNom === 0 ? 0 : Math.abs(sigma / sigmaNom);
+  const fixedTip = input.boundaryConditions.fixEndFace ? 0 : tip;
+  const rightFaceFixed = input.boundaryConditions.fixEndFace ? 0 : tip;
 
   return {
     nodalDisplacements: [
       { nodeId: 0, xIn: 0, yIn: 0, zIn: 0, uxIn: 0, uyIn: 0, uzIn: 0, dispMagIn: 0, vmPsi: vm },
-      { nodeId: 1, xIn: L, yIn: W, zIn: t / 2, uxIn: 0, uyIn: tip, uzIn: 0, dispMagIn: Math.abs(tip), vmPsi: vm }
+      {
+        nodeId: 1,
+        xIn: L,
+        yIn: W,
+        zIn: t / 2,
+        uxIn: fixedTip,
+        uyIn: V !== 0 && !input.boundaryConditions.fixEndFace ? tip : 0,
+        uzIn: 0,
+        dispMagIn: Math.abs(fixedTip),
+        vmPsi: vm
+      }
     ],
     strainTensor: [[eps, 0, 0], [0, -nu * eps, 0], [0, 0, -nu * eps]],
     stressTensor: [[sigma, 0, 0], [0, 0, 0], [0, 0, 0]],
@@ -118,10 +258,13 @@ const solveLocal = (input: SolveInput): FemResult => {
     stiffnessMatrix: [[k, -k], [-k, k]],
     massMatrix: [[1, 0], [0, 1]],
     dampingMatrix: [[0.01, 0], [0, 0.01]],
-    forceVector: [0, P],
-    displacementVector: [0, tip],
+    forceVector: [P, 0],
+    displacementVector: [0, rightFaceFixed],
     beamStations: fmtStations(input),
-    diagnostics: ['Web preview mode: local mock solver active.']
+    diagnostics: [
+      'Web preview mode: local mock solver active.',
+      `Mock structural solve: sigma_nom=${sigmaNom.toFixed(3)} psi, sigma_max=${sigma.toFixed(3)} psi, SCF=${scf.toFixed(3)}, support=${input.boundaryConditions.fixStartFace ? 'start-fixed' : 'free-start'}-${input.boundaryConditions.fixEndFace ? 'end-fixed' : 'free-end'}`
+    ]
   };
 };
 
@@ -158,6 +301,8 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
   if (mockTrainingStatus.running) return false;
 
   const epochs = Math.max(1, batch.epochs);
+  const emitEvery = Math.max(1, batch.progressEmitEveryEpochs ?? 1);
+  const networkEvery = Math.max(1, batch.networkEmitEveryEpochs ?? emitEvery * 25);
   const maxTotal = Math.max(epochs, batch.maxTotalEpochs ?? epochs * 20);
   const target = Math.max(0, batch.targetLoss);
   if (batch.learningRate) mockState.learningRate = batch.learningRate;
@@ -167,16 +312,36 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
   let completed = 0;
   let grew = false;
   let pruned = false;
+  let bestVal = Number.MAX_VALUE;
+  let sinceImprove = 0;
+  let lastStage = 'idle';
+  let lastOptimizer = 'pino-adam';
+  let lastLrPhase = 'idle';
+  let recentEvents: string[] = [];
+  const pushRecentEvent = (line: string) => {
+    recentEvents = [...recentEvents, line].slice(-24);
+  };
   mockTrainingStatus = {
     running: true,
     stopRequested: false,
-    completed: false
+    completed: false,
+    diagnostics: {
+      ...mockTrainingStatus.diagnostics,
+      lrSchedulePhase: 'training',
+      currentLearningRate: mockState.learningRate
+    }
   };
 
   while (completed < maxTotal && valLoss > target && !mockTrainingStatus.stopRequested) {
     completed += 1;
     loss = Math.max(target * 0.5, loss * (0.965 + Math.random() * 0.02));
     valLoss = Math.max(target * 0.6, loss * (0.99 + Math.random() * 0.02));
+    if (valLoss < bestVal) {
+      bestVal = valLoss;
+      sinceImprove = 0;
+    } else {
+      sinceImprove += 1;
+    }
 
     if (completed % 80 === 0 && valLoss > target * 1.5 && mockState.architecture[mockState.architecture.length - 2] < 64) {
       mockState.architecture[mockState.architecture.length - 2] += 4;
@@ -194,6 +359,40 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
       totalEpochs: maxTotal,
       loss,
       valLoss,
+      dataLoss: loss * 0.82,
+      physicsLoss: Math.max(1e-8, loss * 0.18),
+      valDataLoss: valLoss * 0.8,
+      valPhysicsLoss: Math.max(1e-8, valLoss * 0.2),
+      momentumResidual: Math.max(1e-8, valLoss * 0.26),
+      kinematicResidual: Math.max(1e-8, valLoss * 0.24),
+      materialResidual: Math.max(1e-8, valLoss * 0.22),
+      boundaryResidual: Math.max(1e-8, valLoss * 0.28),
+      displacementFit: Math.max(1e-8, valLoss * 0.3),
+      stressFit: Math.max(1e-8, valLoss * 0.34),
+      invariantResidual: Math.max(1e-8, valLoss * 0.12),
+      constitutiveNormalResidual: Math.max(1e-8, valLoss * 0.14),
+      constitutiveShearResidual: Math.max(1e-8, valLoss * 0.08),
+      valDisplacementFit: Math.max(1e-8, valLoss * 0.3),
+      valStressFit: Math.max(1e-8, valLoss * 0.34),
+      valInvariantResidual: Math.max(1e-8, valLoss * 0.12),
+      valConstitutiveNormalResidual: Math.max(1e-8, valLoss * 0.14),
+      valConstitutiveShearResidual: Math.max(1e-8, valLoss * 0.08),
+      hybridMode: valLoss > 0.2 ? 'data-dominant' : valLoss > 0.08 ? 'hybrid' : 'pinn-dominant',
+      stageId: completed < Math.max(30, Math.floor(maxTotal * 0.2)) ? 'stage-1' : 'stage-2',
+      optimizerId: sinceImprove > 120 ? 'pino-lbfgs' : 'pino-adam',
+      lrPhase: sinceImprove > 120 ? 'pino-decay' : 'pino-steady',
+      targetBandLow: Math.max(0, bestVal * 0.97),
+      targetBandHigh: Math.max(0, bestVal * 1.03),
+      trendSlope: -Math.max(0, Math.min(0.01, (bestVal - valLoss) / Math.max(1, completed))),
+      trendVariance: Math.max(1e-9, Math.abs(valLoss - bestVal) * 0.01),
+      watchdogTriggerCount: 0,
+      collocationSamplesAdded: Math.max(64, batch.collocationPoints ?? 512),
+      trainDataSize: Math.max(128, Math.floor((batch.collocationPoints ?? 512) * 0.4)),
+      trainDataCap: Math.max(256, Math.floor((batch.collocationPoints ?? 512) * 0.8)),
+      residualWeightMomentum: 1,
+      residualWeightKinematics: 1,
+      residualWeightMaterial: 1,
+      residualWeightBoundary: 1,
       learningRate: mockState.learningRate,
       architecture: [...mockState.architecture],
       progressRatio: completed / maxTotal,
@@ -208,9 +407,57 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
       architecture: [...mockState.architecture],
       progressRatio: completed / maxTotal
     };
-    lastMockTick = tick;
-    emitMock('ann-training-tick', tick);
-    emitMock('ann-training-progress', progress);
+    if (completed === 1 || completed % emitEvery === 0 || completed === maxTotal) {
+      if (progress.stageId !== lastStage) {
+        pushRecentEvent(`e${completed} stage ${lastStage} -> ${progress.stageId}`);
+        lastStage = progress.stageId;
+      }
+      if (progress.optimizerId !== lastOptimizer) {
+        pushRecentEvent(`e${completed} optimizer ${lastOptimizer} -> ${progress.optimizerId}`);
+        lastOptimizer = progress.optimizerId;
+      }
+      if (progress.lrPhase !== lastLrPhase) {
+        pushRecentEvent(`e${completed} lr-phase ${lastLrPhase} -> ${progress.lrPhase}`);
+        lastLrPhase = progress.lrPhase;
+      }
+      lastMockTick = tick;
+      lastMockProgress = progress;
+      mockTrainingStatus = {
+        ...mockTrainingStatus,
+        diagnostics: {
+          ...mockTrainingStatus.diagnostics,
+          bestValLoss: bestVal,
+          epochsSinceImprovement: sinceImprove,
+          currentLearningRate: mockState.learningRate,
+          lrSchedulePhase: sinceImprove > 30 ? 'pino-decay' : 'pino-steady',
+          targetFloorEstimate: bestVal,
+          activeStage: progress.stageId,
+          activeOptimizer: progress.optimizerId,
+          residualWeightMomentum: progress.residualWeightMomentum,
+          residualWeightKinematics: progress.residualWeightKinematics,
+          residualWeightMaterial: progress.residualWeightMaterial,
+          residualWeightBoundary: progress.residualWeightBoundary,
+          dataWeight: progress.residualWeightMomentum + progress.residualWeightKinematics,
+          physicsWeight: progress.residualWeightMaterial + progress.residualWeightBoundary,
+          momentumResidual: progress.momentumResidual,
+          kinematicResidual: progress.kinematicResidual,
+          materialResidual: progress.materialResidual,
+          boundaryResidual: progress.boundaryResidual,
+          hybridMode: progress.hybridMode,
+          collocationPoints: Math.max(64, batch.collocationPoints ?? 512),
+          boundaryPoints: Math.max(16, batch.boundaryPoints ?? 128),
+          interfacePoints: Math.max(16, batch.interfacePoints ?? 128),
+          collocationSamplesAdded: progress.collocationSamplesAdded,
+          trainDataSize: progress.trainDataSize,
+          trainDataCap: progress.trainDataCap,
+          recentEvents
+        }
+      };
+      emitMock('ann-training-tick', tick);
+      if (completed % networkEvery === 0 || completed === 1 || completed === maxTotal) {
+        emitMock('ann-training-progress', progress);
+      }
+    }
     await new Promise((r) => setTimeout(r, 10));
   }
 
@@ -227,6 +474,8 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
     pruned,
     completedEpochs: completed,
     reachedTarget: valLoss <= target,
+    reachedTargetLoss: valLoss <= target,
+    reachedAutonomousConvergence: false,
     stopReason: mockTrainingStatus.stopRequested
       ? 'manual-stop'
       : valLoss <= target
@@ -238,7 +487,14 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
     running: false,
     stopRequested: false,
     completed: true,
-    lastResult: result
+    lastResult: result,
+    diagnostics: {
+      ...mockTrainingStatus.diagnostics,
+      bestValLoss: Math.min(mockTrainingStatus.diagnostics.bestValLoss, result.valLoss),
+      currentLearningRate: result.learningRate,
+      lrSchedulePhase: result.stopReason,
+      boSelectedArchitecture: [...result.architecture]
+    }
   };
   emitMock('ann-training-complete', result);
   return true;
@@ -282,7 +538,11 @@ export const inferAnn = async (input: SolveInput) => {
     uncertainty: Math.min(0.95, mockState.lastLoss * 2),
     modelVersion: mockState.modelVersion,
     usedFemFallback: false,
-    diagnostics: ['Web preview mode: local mock ANN infer active.']
+    fallbackReason: null,
+    residualScore: 0,
+    uncertaintyThreshold: mockSafeguardSettings.uncertaintyThreshold,
+    residualThreshold: mockSafeguardSettings.residualThreshold,
+    diagnostics: ['Web preview mode: local mock PINO infer active.']
   };
 };
 
@@ -290,7 +550,11 @@ export const runDynamicCase = (input: DynamicInput) => {
   if (isTauriRuntime()) return invoke<DynamicResult>('run_dynamic_case', { input });
   const n = Math.max(2, Math.floor(input.endTimeS / input.timeStepS));
   const t = Array.from({ length: n + 1 }, (_, i) => i * input.timeStepS);
-  const amp = (input.solveInput.load.verticalPointLoadLbf / 10000) * input.pulseScale;
+  const drivingLoad =
+    input.solveInput.load.axialLoadLbf !== 0
+      ? input.solveInput.load.axialLoadLbf
+      : input.solveInput.load.verticalPointLoadLbf;
+  const amp = (drivingLoad / 10000) * input.pulseScale;
   const y = t.map((tt) => amp * Math.sin((2 * Math.PI * tt) / Math.max(input.endTimeS, 1e-6)) * Math.exp(-input.dampingRatio * 6 * tt));
   return Promise.resolve({
     timeS: t,
@@ -341,13 +605,182 @@ export const getModelStatus = () => {
     lastLoss: mockState.lastLoss,
     trainSamples: mockState.trainSamples,
     auditFrequency: mockState.auditFrequency,
-    fallbackEnabled: mockState.fallbackEnabled
+    fallbackEnabled: mockState.fallbackEnabled,
+    safeguardSettings: { ...mockSafeguardSettings }
   });
+};
+
+export const setSafeguardSettings = (settings: SafeguardSettings) => {
+  if (isTauriRuntime()) return invoke<ModelStatus>('set_safeguard_settings', { settings });
+  mockSafeguardSettings = {
+    ...settings,
+    uncertaintyThreshold: Math.max(0.01, Math.min(0.99, settings.uncertaintyThreshold)),
+    residualThreshold: Math.max(1e-6, Math.min(10, settings.residualThreshold))
+  };
+  return getModelStatus();
+};
+
+export const resetAnnModel = (seed?: number) => {
+  if (isTauriRuntime()) return invoke<ModelStatus>('reset_ann_model', { seed });
+  mockState.modelVersion = 1;
+  mockState.architecture = [19, 16, 16, 9];
+  mockState.learningRate = 5e-4;
+  mockState.lastLoss = 0.2;
+  mockState.trainSamples = 0;
+  mockTrainingStatus = {
+    running: false,
+    stopRequested: false,
+    completed: false,
+    diagnostics: {
+      bestValLoss: Number.MAX_VALUE,
+      epochsSinceImprovement: 0,
+      lrSchedulePhase: 'idle',
+      currentLearningRate: mockState.learningRate,
+      dataWeight: 2,
+      physicsWeight: 2,
+      residualWeightMomentum: 1,
+      residualWeightKinematics: 1,
+      residualWeightMaterial: 1,
+      residualWeightBoundary: 1,
+      activeLearningRounds: 0,
+      activeLearningSamplesAdded: 0,
+      safeguardTriggers: 0,
+      curriculumBackoffs: 0,
+      optimizerSwitches: 0,
+      checkpointRollbacks: 0,
+      targetFloorEstimate: 0,
+      trendStopReason: 'idle',
+      activeStage: 'idle',
+      activeOptimizer: 'pino-adam',
+      boPresearchUsed: false,
+      boSelectedArchitecture: [...mockState.architecture],
+      momentumResidual: 0,
+      kinematicResidual: 0,
+      materialResidual: 0,
+      boundaryResidual: 0,
+      displacementFit: 0,
+      stressFit: 0,
+      invariantResidual: 0,
+      constitutiveNormalResidual: 0,
+      constitutiveShearResidual: 0,
+      valDisplacementFit: 0,
+      valStressFit: 0,
+      valInvariantResidual: 0,
+      valConstitutiveNormalResidual: 0,
+      valConstitutiveShearResidual: 0,
+      hybridMode: 'hybrid',
+      collocationPoints: 512,
+      boundaryPoints: 128,
+      interfacePoints: 128,
+      collocationSamplesAdded: 0,
+      trainDataSize: 0,
+      trainDataCap: 0,
+      recentEvents: []
+    }
+  };
+  lastMockTick = {
+    epoch: 0,
+    totalEpochs: 0,
+    loss: 0,
+    valLoss: 0,
+    learningRate: mockState.learningRate,
+    architecture: [...mockState.architecture],
+    progressRatio: 0
+  };
+  lastMockProgress = {
+    ...lastMockProgress,
+    epoch: 0,
+    totalEpochs: 0,
+    loss: 0,
+    valLoss: 0,
+    dataLoss: 0,
+    physicsLoss: 0,
+    valDataLoss: 0,
+    valPhysicsLoss: 0,
+    momentumResidual: 0,
+    kinematicResidual: 0,
+    materialResidual: 0,
+    boundaryResidual: 0,
+    hybridMode: 'hybrid',
+    stageId: 'idle',
+    optimizerId: 'pino-adam',
+    lrPhase: 'idle',
+    targetBandLow: 0,
+    targetBandHigh: 0,
+    trendSlope: 0,
+    trendVariance: 0,
+    watchdogTriggerCount: 0,
+    collocationSamplesAdded: 0,
+    trainDataSize: 0,
+    trainDataCap: 0,
+    residualWeightMomentum: 1,
+    residualWeightKinematics: 1,
+    residualWeightMaterial: 1,
+    residualWeightBoundary: 1,
+    learningRate: mockState.learningRate,
+    architecture: [...mockState.architecture],
+    progressRatio: 0
+  };
+  return getModelStatus();
 };
 
 export const getTrainingTick = () => {
   if (isTauriRuntime()) return invoke<TrainingTickEvent>('get_training_tick');
   return Promise.resolve(lastMockTick);
+};
+
+export const getTrainingProgress = () => {
+  if (isTauriRuntime()) return invoke<TrainingProgressEvent>('get_training_progress');
+  return Promise.resolve(lastMockProgress);
+};
+
+export const saveTrainingCheckpoint = (input: CheckpointSaveInput = {}) => {
+  if (isTauriRuntime()) return invoke<TrainingCheckpointInfo>('save_training_checkpoint', { input });
+  const now = Date.now();
+  const cp: TrainingCheckpointInfo = {
+    id: `mock-${now}`,
+    tag: input.tag ?? 'manual',
+    path: `mock://checkpoint/${now}`,
+    createdEpoch: lastMockTick.epoch,
+    modelVersion: mockState.modelVersion,
+    bestValLoss: mockTrainingStatus.diagnostics.bestValLoss,
+    isBest: Boolean(input.markBest),
+    createdAtUnixMs: now
+  };
+  mockCheckpoints.unshift(cp);
+  return Promise.resolve(cp);
+};
+
+export const listTrainingCheckpoints = () => {
+  if (isTauriRuntime()) return invoke<TrainingCheckpointInfo[]>('list_training_checkpoints');
+  return Promise.resolve([...mockCheckpoints]);
+};
+
+export const resumeTrainingFromCheckpoint = (id: string) => {
+  if (isTauriRuntime()) return invoke<ResumeTrainingResult>('resume_training_from_checkpoint', { id });
+  const cp = mockCheckpoints.find((c) => c.id === id);
+  if (!cp) return Promise.reject(new Error('Checkpoint not found'));
+  return Promise.resolve({
+    checkpoint: cp,
+    modelStatus: {
+      modelVersion: mockState.modelVersion,
+      architecture: [...mockState.architecture],
+      learningRate: mockState.learningRate,
+      lastLoss: mockState.lastLoss,
+      trainSamples: mockState.trainSamples,
+      auditFrequency: mockState.auditFrequency,
+      fallbackEnabled: mockState.fallbackEnabled,
+      safeguardSettings: { ...mockSafeguardSettings }
+    }
+  });
+};
+
+export const purgeTrainingCheckpoints = (retentionPolicy: CheckpointRetentionPolicy) => {
+  if (isTauriRuntime()) return invoke<PurgeCheckpointsResult>('purge_training_checkpoints', { retentionPolicy });
+  const keep = Math.max(1, retentionPolicy.keepLast ?? 5);
+  const removed = Math.max(0, mockCheckpoints.length - keep);
+  mockCheckpoints.splice(keep);
+  return Promise.resolve({ removed, kept: mockCheckpoints.length });
 };
 
 export const exportReport = (input: ReportInput) => {

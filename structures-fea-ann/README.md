@@ -2,6 +2,12 @@
 
 Offline, self-contained desktop application for plate mechanics analysis using Svelte 5 + TypeScript + Tauri 2 + Rust.
 
+## Prerequisites
+- Node.js 20
+- Rust stable toolchain
+- npm
+- Bash for the benchmark and training helper scripts
+
 ## Key capabilities
 - 3D plate baseline case (10 in x 4 in x 0.125 in, 1000 lbf axial load)
 - FEM solve endpoint with matrix formulation outputs
@@ -22,11 +28,18 @@ npm install
 npm run tauri:dev
 ```
 
-## Check
+## Validate
 ```bash
+npm run lint
 npm run check
+npm test
 cd src-tauri && cargo check
+cd src-tauri && cargo test
 ```
+
+## CI Gates
+- PR and push checks run `npm run lint`, repo hardening tests, Rust format checks, `cargo check`, and `cargo test` on Linux.
+- Release signoff adds benchmark/profile verification and the documented PINO regression gates.
 
 ## Windows compatibility
 - Built on Tauri 2 (cross-platform desktop runtime)

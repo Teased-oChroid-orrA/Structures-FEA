@@ -1,0 +1,98 @@
+name: release-signoff
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release-signoff:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: structures-fea-ann
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: structures-fea-ann/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Frontend checks
+        run: npm run lint
+
+      - name: Offline guard
+        run: npm run verify:offline
+
+      - name: UI budget guard
+        run: npm run verify:ui-budgets
+
+      - name: Repo hardening tests
+        run: npm test
+
+      - name: Rust check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust tests
+        if: runner.os == 'Linux'
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Benchmark profile (ubuntu only)
+        if: runner.os == 'Linux'
+        run: npm run benchmark:profile
+
+      - name: Benchmark lock gate (ubuntu only)
+        if: runner.os == 'Linux'
+        run: npm run verify:benchmark-lock
+
+      - name: PINO signoff profile (ubuntu only)
+        if: runner.os == 'Linux'
+        run: npm run benchmark:pino-signoff
+
+      - name: PINO signoff lock gate (ubuntu only)
+        if: runner.os == 'Linux'
+        run: npm run verify:pino-signoff-lock
+
+      - name: PINO regression gates (ubuntu only)
+        if: runner.os == 'Linux'
+        run: npm run verify:pino-regression-gates
+
+      - name: Benchmark diff artifact (ubuntu only)
+        if: runner.os == 'Linux'
+        run: npm run benchmark:diff
+
+      - name: Upload benchmark artifact (ubuntu only)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-profile
+          path: structures-fea-ann/output/benchmarks/latest.md
+          if-no-files-found: error
+
+      - name: Upload benchmark lock diff (ubuntu only)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-lock-diff
+          path: structures-fea-ann/output/benchmarks/lock-diff.md
+          if-no-files-found: error
+
+      - name: Upload PINO signoff artifact (ubuntu only)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pino-signoff-profile
+          path: structures-fea-ann/output/benchmarks/pino-signoff-latest.md
+          if-no-files-found: error

@@ -32,7 +32,16 @@ jobs:
         run: npm ci
 
       - name: Frontend type/lint checks
-        run: npm run check
+        run: npm run lint
+
+      - name: Offline guard
+        run: npm run verify:offline
+
+      - name: UI budget guard
+        run: npm run verify:ui-budgets
+
+      - name: Repo hardening tests
+        run: npm test
 
       - name: Frontend production build
         run: npm run build

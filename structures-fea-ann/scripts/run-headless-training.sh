@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROFILE="${1:-smoke}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT_DIR="$ROOT/output/headless-training"
+mkdir -p "$OUT_DIR"
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+RAW="$OUT_DIR/headless-${PROFILE}-${TS}.log"
+LATEST="$OUT_DIR/latest-${PROFILE}.log"
+TEST_FLAGS=(-- --nocapture)
+
+case "$PROFILE" in
+  smoke)
+    TEST_NAME="pinn::tests::pino_runtime_infer_returns_operator_backed_result"
+    ;;
+  default)
+    TEST_NAME="pinn::tests::burn_runtime_compact_default_profile_stays_finite"
+    export HEADLESS_RELEASE="${HEADLESS_RELEASE:-1}"
+    ;;
+  adaptive)
+    TEST_NAME="pinn::tests::pino_runtime_adapts_architecture_on_plateau_with_guardrails"
+    ;;
+  default-1e9)
+    TEST_NAME="pinn::tests::pino_headless_default_target_1e9_diagnostic"
+    export PINO_HEADLESS_MAX_TOTAL="${PINO_HEADLESS_MAX_TOTAL:-10000}"
+    export PINO_HEADLESS_MAX_BACKOFFS="${PINO_HEADLESS_MAX_BACKOFFS:-12}"
+    export PINO_HEADLESS_STAGE1="${PINO_HEADLESS_STAGE1:-120}"
+    export PINO_HEADLESS_STAGE2="${PINO_HEADLESS_STAGE2:-180}"
+    export PINO_HEADLESS_STAGE3="${PINO_HEADLESS_STAGE3:-240}"
+    TEST_FLAGS=(-- --ignored --nocapture)
+    ;;
+  default-1e9-fast)
+    TEST_NAME="pinn::tests::pino_headless_default_target_1e9_diagnostic"
+    export HEADLESS_RELEASE="${HEADLESS_RELEASE:-1}"
+    export PINO_HEADLESS_MAX_TOTAL="${PINO_HEADLESS_MAX_TOTAL:-240}"
+    export PINO_HEADLESS_MAX_BACKOFFS="${PINO_HEADLESS_MAX_BACKOFFS:-2}"
+    export PINO_HEADLESS_STAGE1="${PINO_HEADLESS_STAGE1:-12}"
+    export PINO_HEADLESS_STAGE2="${PINO_HEADLESS_STAGE2:-24}"
+    export PINO_HEADLESS_STAGE3="${PINO_HEADLESS_STAGE3:-36}"
+    export PINO_HEADLESS_COLLOCATION="${PINO_HEADLESS_COLLOCATION:-256}"
+    export PINO_HEADLESS_BOUNDARY="${PINO_HEADLESS_BOUNDARY:-64}"
+    export PINO_HEADLESS_INTERFACE="${PINO_HEADLESS_INTERFACE:-32}"
+    export PINO_HEADLESS_PROGRESS_EVERY="${PINO_HEADLESS_PROGRESS_EVERY:-1}"
+    export PINO_HEADLESS_NETWORK_EVERY="${PINO_HEADLESS_NETWORK_EVERY:-12}"
+    export PINO_HEADLESS_MAX_TOPOLOGY="${PINO_HEADLESS_MAX_TOPOLOGY:-48}"
+    export PINO_HEADLESS_MAX_RUNTIME_S="${PINO_HEADLESS_MAX_RUNTIME_S:-600}"
+    export PINO_HEADLESS_SKIP_EXACT_REFINE="${PINO_HEADLESS_SKIP_EXACT_REFINE:-0}"
+    export PINO_HEADLESS_ONLINE_ACTIVE_LEARNING="${PINO_HEADLESS_ONLINE_ACTIVE_LEARNING:-0}"
+    export PINO_HEADLESS_FAST_PROFILE="${PINO_HEADLESS_FAST_PROFILE:-1}"
+    export PINO_DISABLE_INNER_HOLDOUT_REFRESH="${PINO_DISABLE_INNER_HOLDOUT_REFRESH:-1}"
+    export PINO_HEADLESS_FIELD_HEAD_STRIDE="${PINO_HEADLESS_FIELD_HEAD_STRIDE:-12}"
+    export PINO_HEADLESS_HOLDOUT_REFRESH_STRIDE="${PINO_HEADLESS_HOLDOUT_REFRESH_STRIDE:-16}"
+    export PINO_HEADLESS_EXACT_REFINE_ROUNDS="${PINO_HEADLESS_EXACT_REFINE_ROUNDS:-2}"
+    export PINO_HEADLESS_EXACT_REFINE_STEP_CAP="${PINO_HEADLESS_EXACT_REFINE_STEP_CAP:-32}"
+    TEST_FLAGS=(-- --ignored --nocapture)
+    ;;
+  exact-ui)
+    TEST_NAME="pinn::tests::burn_runtime_exact_ui_default_cantilever_batch_stays_healthy"
+    TEST_FLAGS=(-- --nocapture)
+    ;;
+  *)
+    echo "Unknown profile: $PROFILE"
+    echo "Use one of: smoke, default, adaptive, default-1e9, default-1e9-fast, exact-ui"
+    exit 2
+    ;;
+esac
+
+cd "$ROOT/src-tauri"
+echo "headless-training: profile=$PROFILE test=$TEST_NAME"
+echo "headless-training: streaming log to $RAW"
+if [[ "${HEADLESS_RELEASE:-0}" == "1" ]]; then
+  cargo test --release "$TEST_NAME" "${TEST_FLAGS[@]}" 2>&1 | tee "$RAW"
+else
+  cargo test "$TEST_NAME" "${TEST_FLAGS[@]}" 2>&1 | tee "$RAW"
+fi
+cp "$RAW" "$LATEST"
+
+echo "headless-training: wrote $RAW and $LATEST"

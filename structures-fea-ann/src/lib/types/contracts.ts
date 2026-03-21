@@ -2,6 +2,7 @@ export type GeometryInput = {
   lengthIn: number;
   widthIn: number;
   thicknessIn: number;
+  holeDiameterIn?: number;
 };
 
 export type MeshControls = {
@@ -134,10 +135,40 @@ export type TrainingBatch = {
   cases: SolveInput[];
   epochs: number;
   targetLoss: number;
+  seed?: number;
+  analysisType?: 'general' | 'cantilever' | 'plate-hole';
+  pinnBackend?:
+    | 'pino-ndarray-cpu'
+    | 'pino-candle-cpu'
+    | 'pino-candle-cuda'
+    | 'pino-candle-metal'
+    | 'burn-ndarray-cpu'
+    | 'burn-wgpu';
+  collocationPoints?: number;
+  boundaryPoints?: number;
+  interfacePoints?: number;
+  residualWeightMomentum?: number;
+  residualWeightKinematics?: number;
+  residualWeightMaterial?: number;
+  residualWeightBoundary?: number;
+  stage1Epochs?: number;
+  stage2Epochs?: number;
+  stage3RampEpochs?: number;
+  contactPenalty?: number;
+  plasticityFactor?: number;
   learningRate?: number;
   autoMode?: boolean;
   maxTotalEpochs?: number;
   minImprovement?: number;
+  progressEmitEveryEpochs?: number;
+  networkEmitEveryEpochs?: number;
+  onlineActiveLearning?: boolean;
+  autonomousMode?: boolean;
+  maxTopology?: number;
+  maxBackoffs?: number;
+  maxOptimizerSwitches?: number;
+  checkpointEveryEpochs?: number;
+  checkpointRetention?: number;
 };
 
 export type NetworkNodeSnapshot = {
@@ -162,15 +193,114 @@ export type NetworkSnapshot = {
   connections: NetworkConnectionSnapshot[];
 };
 
+export type OperatorGridSpec = {
+  nx: number;
+  ny: number;
+  nz: number;
+  inputChannels: number;
+  outputChannels: number;
+};
+
+export type HoldoutValidationSummary = {
+  trusted: boolean;
+  trainingSeedCases: number;
+  holdoutCases: number;
+  meanDisplacementError: number;
+  meanVonMisesError: number;
+  p95FieldError: number;
+  residualRatio: number;
+  acceptedWithoutFallback: boolean;
+  meanErrorLimit: number;
+  p95ErrorLimit: number;
+  residualRatioLimit: number;
+  displacementPass: boolean;
+  vonMisesPass: boolean;
+  p95Pass: boolean;
+  residualRatioPass: boolean;
+};
+
+export type SurrogateDomainSummary = {
+  featureLabels: string[];
+  featureMins: number[];
+  featureMaxs: number[];
+  coverageTags: string[];
+  trainingSeedCases: number;
+  expandedCases: number;
+  mixedLoadCases: number;
+  holeCases: number;
+  dualFixedCases: number;
+};
+
+export type PinoRuntimeMetadata = {
+  engineId: string;
+  backend: string;
+  spectralModes: number;
+  operatorGrid: OperatorGridSpec;
+  domainDim: number;
+  physicsModel: string;
+  spectralModes3d: [number, number, number];
+  operatorGrid3d?: OperatorGridSpec | null;
+  boundaryMode?: string | null;
+  objectiveMode?: string | null;
+  localRefinement?: {
+    enabled: boolean;
+    strategy: string;
+    maxPatches: number;
+    maxPatchCells: number;
+  } | null;
+  localEnrichment?: {
+    enabled: boolean;
+    strategy: string;
+  } | null;
+  calibrationStressScale?: number | null;
+  calibrationDisplacementScale?: number | null;
+  holdoutValidation?: HoldoutValidationSummary | null;
+};
+
 export type TrainingProgressEvent = {
   epoch: number;
   totalEpochs: number;
   loss: number;
   valLoss: number;
+  dataLoss: number;
+  physicsLoss: number;
+  valDataLoss: number;
+  valPhysicsLoss: number;
+  momentumResidual: number;
+  kinematicResidual: number;
+  materialResidual: number;
+  boundaryResidual: number;
+  displacementFit: number;
+  stressFit: number;
+  invariantResidual: number;
+  constitutiveNormalResidual: number;
+  constitutiveShearResidual: number;
+  valDisplacementFit: number;
+  valStressFit: number;
+  valInvariantResidual: number;
+  valConstitutiveNormalResidual: number;
+  valConstitutiveShearResidual: number;
+  hybridMode: string;
+  stageId: string;
+  optimizerId: string;
+  lrPhase: string;
+  targetBandLow: number;
+  targetBandHigh: number;
+  trendSlope: number;
+  trendVariance: number;
+  watchdogTriggerCount: number;
+  collocationSamplesAdded: number;
+  trainDataSize: number;
+  trainDataCap: number;
+  residualWeightMomentum: number;
+  residualWeightKinematics: number;
+  residualWeightMaterial: number;
+  residualWeightBoundary: number;
   learningRate: number;
   architecture: number[];
   progressRatio: number;
   network: NetworkSnapshot;
+  pino?: PinoRuntimeMetadata | null;
 };
 
 export type TrainingTickEvent = {
@@ -189,6 +319,86 @@ export type TrainingRunStatus = {
   completed: boolean;
   lastResult?: TrainResult;
   lastError?: string;
+  diagnostics: TrainingDiagnostics;
+};
+
+export type TrainingDiagnostics = {
+  bestValLoss: number;
+  epochsSinceImprovement: number;
+  lrSchedulePhase: string;
+  currentLearningRate: number;
+  dataWeight: number;
+  physicsWeight: number;
+  residualWeightMomentum: number;
+  residualWeightKinematics: number;
+  residualWeightMaterial: number;
+  residualWeightBoundary: number;
+  activeLearningRounds: number;
+  activeLearningSamplesAdded: number;
+  safeguardTriggers: number;
+  curriculumBackoffs: number;
+  optimizerSwitches: number;
+  checkpointRollbacks: number;
+  targetFloorEstimate: number;
+  trendStopReason: string;
+  activeStage: string;
+  activeOptimizer: string;
+  boPresearchUsed: boolean;
+  boSelectedArchitecture: number[];
+  momentumResidual: number;
+  kinematicResidual: number;
+  materialResidual: number;
+  boundaryResidual: number;
+  displacementFit: number;
+  stressFit: number;
+  invariantResidual: number;
+  constitutiveNormalResidual: number;
+  constitutiveShearResidual: number;
+  valDisplacementFit: number;
+  valStressFit: number;
+  valInvariantResidual: number;
+  valConstitutiveNormalResidual: number;
+  valConstitutiveShearResidual: number;
+  hybridMode: string;
+  collocationPoints: number;
+  boundaryPoints: number;
+  interfacePoints: number;
+  collocationSamplesAdded: number;
+  trainDataSize: number;
+  trainDataCap: number;
+  recentEvents: string[];
+  pino?: PinoRuntimeMetadata | null;
+};
+
+export type TrainingCheckpointInfo = {
+  id: string;
+  tag: string;
+  path: string;
+  createdEpoch: number;
+  modelVersion: number;
+  bestValLoss: number;
+  isBest: boolean;
+  createdAtUnixMs: number;
+};
+
+export type CheckpointSaveInput = {
+  tag?: string;
+  markBest?: boolean;
+};
+
+export type CheckpointRetentionPolicy = {
+  keepLast: number;
+  keepBest: number;
+};
+
+export type ResumeTrainingResult = {
+  checkpoint: TrainingCheckpointInfo;
+  modelStatus: ModelStatus;
+};
+
+export type PurgeCheckpointsResult = {
+  removed: number;
+  kept: number;
 };
 
 export type TrainResult = {
@@ -201,8 +411,11 @@ export type TrainResult = {
   pruned: boolean;
   completedEpochs: number;
   reachedTarget: boolean;
+  reachedTargetLoss?: boolean;
+  reachedAutonomousConvergence?: boolean;
   stopReason: string;
   notes: string[];
+  pino?: PinoRuntimeMetadata | null;
 };
 
 export type AnnResult = {
@@ -211,7 +424,14 @@ export type AnnResult = {
   uncertainty: number;
   modelVersion: number;
   usedFemFallback: boolean;
+  fallbackReason?: string | null;
+  domainExtrapolationScore?: number;
+  residualScore?: number;
+  uncertaintyThreshold?: number;
+  residualThreshold?: number;
   diagnostics: string[];
+  surrogateDomain?: SurrogateDomainSummary | null;
+  pino?: PinoRuntimeMetadata | null;
 };
 
 export type ModelStatus = {
@@ -222,6 +442,26 @@ export type ModelStatus = {
   trainSamples: number;
   auditFrequency: number;
   fallbackEnabled: boolean;
+  safeguardSettings: SafeguardSettings;
+  surrogateDomain?: SurrogateDomainSummary | null;
+  pino?: PinoRuntimeMetadata | null;
+};
+
+export type SafeguardSettings = {
+  preset: string;
+  uncertaintyThreshold: number;
+  residualThreshold: number;
+  adaptiveByGeometry: boolean;
+};
+
+export type RuntimeFingerprint = {
+  appVersion: string;
+  buildProfile: string;
+  targetOs: string;
+  targetArch: string;
+  debugBuild: boolean;
+  gitCommit: string;
+  buildTimeUtc: string;
 };
 
 export type ReportInput = {
@@ -241,38 +481,41 @@ export type ExportResult = {
   format: string;
 };
 
+export const MAX_DENSE_SOLVER_DOFS = 3200;
+
 export const defaultSolveInput: SolveInput = {
   geometry: {
-    lengthIn: 10,
-    widthIn: 4,
-    thicknessIn: 0.125
+    lengthIn: 11.811,
+    widthIn: 4.724,
+    thicknessIn: 0.25,
+    holeDiameterIn: 2.362
   },
   mesh: {
-    nx: 10,
-    ny: 4,
+    nx: 28,
+    ny: 14,
     nz: 1,
     elementType: 'hex8',
     autoAdapt: true,
-    maxDofs: 12000,
+    maxDofs: MAX_DENSE_SOLVER_DOFS,
     amrEnabled: true,
-    amrPasses: 2,
-    amrMaxNx: 28,
-    amrRefineRatio: 1.2
+    amrPasses: 3,
+    amrMaxNx: 40,
+    amrRefineRatio: 1.15
   },
   material: {
-    ePsi: 10_000_000,
-    nu: 0.33,
-    rhoLbIn3: 0.0975,
-    alphaPerF: 13e-6,
-    yieldStrengthPsi: 40_000
+    ePsi: 29_000_000,
+    nu: 0.3,
+    rhoLbIn3: 0.283,
+    alphaPerF: 6.5e-6,
+    yieldStrengthPsi: 36_000
   },
   boundaryConditions: {
     fixStartFace: true,
     fixEndFace: false
   },
   load: {
-    axialLoadLbf: 0,
-    verticalPointLoadLbf: -1000
+    axialLoadLbf: 1712,
+    verticalPointLoadLbf: 0
   },
   unitSystem: 'inch-lbf-second',
   deltaTF: 0

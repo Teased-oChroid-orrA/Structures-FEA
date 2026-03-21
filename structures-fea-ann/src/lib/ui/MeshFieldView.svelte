@@ -132,7 +132,7 @@
     </svg>
   {:else}
     <div class="panel stack">
-      <p>Run FEM or ANN solve to generate nodal mesh and stress data.</p>
+      <p>Run FEM solve or PINO inference to generate nodal mesh and stress data.</p>
     </div>
   {/if}
 </section>

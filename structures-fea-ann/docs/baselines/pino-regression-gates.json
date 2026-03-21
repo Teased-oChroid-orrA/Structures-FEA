@@ -1,0 +1,28 @@
+{
+  "name": "pino-regression-gates",
+  "source": "scripts/run-pino-regression-gates.sh",
+  "defaults": {
+    "fastProfile": 1,
+    "residualRefine": 1
+  },
+  "regimes": {
+    "cantilever": {
+      "maxMeanDisp": 0.12,
+      "maxMeanVm": 0.01,
+      "maxP95": 0.13,
+      "maxRatio": 2.30
+    },
+    "axial": {
+      "maxMeanDisp": 0.04,
+      "maxMeanVm": 0.075,
+      "maxP95": 0.085,
+      "maxRatio": 1.50
+    },
+    "plate-hole": {
+      "maxMeanDisp": 0.001,
+      "maxMeanVm": 0.053,
+      "maxP95": 0.055,
+      "maxRatio": 1.06
+    }
+  }
+}
