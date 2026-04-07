@@ -4251,8 +4251,13 @@ impl UniversalPinnEngine {
                 let plateau_trigger = no_improve_epochs >= pino_adapt_plateau
                     && no_improve_epochs % pino_adapt_plateau == 0
                     && val_residual_total > 0.05;
+                let overfit_val_metric = if benchmark_metric_tracking {
+                    current_val_metric
+                } else {
+                    val_loss
+                };
                 let overfit_trigger = epoch > 80
-                    && val_loss > (best_val * 1.18).max(1e-9)
+                    && overfit_val_metric > (best_val * 1.18).max(1e-9)
                     && no_improve_epochs >= pino_adapt_overfit
                     && active_cfg.hidden_width > 24
                     && (val_pillars.boundary + val_pillars.material)
