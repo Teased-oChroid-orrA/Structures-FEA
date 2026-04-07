@@ -116,6 +116,20 @@ export type DynamicResult = {
   diagnostics: string[];
 };
 
+export type TrainingBenchmarkManifest = {
+  id: string;
+  title: string;
+  description: string;
+  trainingMode: string;
+  analysisType: string;
+  gateName: string;
+  gateTargetLoss: number;
+  recommendedLearningRate: number;
+  maxRuntimeSeconds: number;
+  recommendedEpochs: number;
+  active: boolean;
+};
+
 export type FailureInput = {
   stressTensor: number[][];
   yieldStrengthPsi: number;
@@ -135,6 +149,8 @@ export type TrainingBatch = {
   cases: SolveInput[];
   epochs: number;
   targetLoss: number;
+  trainingMode?: 'legacy-mixed-exact' | 'benchmark' | 'production-generalized';
+  benchmarkId?: string;
   seed?: number;
   analysisType?: 'general' | 'cantilever' | 'plate-hole';
   pinnBackend?:
@@ -299,8 +315,24 @@ export type TrainingProgressEvent = {
   learningRate: number;
   architecture: number[];
   progressRatio: number;
+  trainingMode?: string;
+  benchmarkId?: string | null;
+  gateStatus?: string;
+  certifiedBestMetric?: number;
+  dominantBlocker?: string | null;
+  stalledReason?: string | null;
   network: NetworkSnapshot;
   pino?: PinoRuntimeMetadata | null;
+};
+
+export type BenchmarkCertification = {
+  status: string;
+  summary: string;
+  suggestedTargetLoss: number;
+  tipDisplacementRelativeError?: number | null;
+  maxDisplacementRelativeError?: number | null;
+  meanVonMisesRelativeError?: number | null;
+  maxSigmaXxRelativeError?: number | null;
 };
 
 export type TrainingTickEvent = {
@@ -366,6 +398,16 @@ export type TrainingDiagnostics = {
   collocationSamplesAdded: number;
   trainDataSize: number;
   trainDataCap: number;
+  trainingMode?: string;
+  benchmarkId?: string | null;
+  gateStatus?: string;
+  certifiedBestMetric?: number;
+  reproducibilitySpread?: number | null;
+  dominantBlocker?: string | null;
+  stalledReason?: string | null;
+  benchmarkCertification?: BenchmarkCertification | null;
+  runBudgetUsed?: number;
+  runBudgetTotal?: number;
   recentEvents: string[];
   pino?: PinoRuntimeMetadata | null;
 };
@@ -415,6 +457,14 @@ export type TrainResult = {
   reachedAutonomousConvergence?: boolean;
   stopReason: string;
   notes: string[];
+  trainingMode?: string | null;
+  benchmarkId?: string | null;
+  gateStatus?: string | null;
+  certifiedBestMetric?: number | null;
+  reproducibilitySpread?: number | null;
+  dominantBlocker?: string | null;
+  stalledReason?: string | null;
+  benchmarkCertification?: BenchmarkCertification | null;
   pino?: PinoRuntimeMetadata | null;
 };
 

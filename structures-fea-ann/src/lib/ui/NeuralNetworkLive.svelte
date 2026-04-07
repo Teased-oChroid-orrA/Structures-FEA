@@ -102,9 +102,15 @@
     )
   );
   const currentLoss = $derived(tick?.loss ?? progress?.loss ?? 0);
-  const validationLoss = $derived(tick?.valLoss ?? progress?.valLoss ?? 0);
+  const validationLoss = $derived.by(() => {
+    const candidates = [progress?.valLoss, progress?.loss, tick?.valLoss, tick?.loss];
+    for (const value of candidates) {
+      if (Number.isFinite(value ?? NaN) && (value as number) > 0) return value as number;
+    }
+    return 0;
+  });
   const latestObservedLoss = $derived.by(() => {
-    const candidates = [progress?.valLoss, tick?.valLoss, progress?.loss, tick?.loss];
+    const candidates = [progress?.valLoss, progress?.loss, tick?.valLoss, tick?.loss];
     for (const value of candidates) {
       if (Number.isFinite(value ?? NaN)) return value as number;
     }

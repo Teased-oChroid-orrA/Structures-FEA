@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ann;
+mod benchmarks;
 mod contracts;
 mod fem;
 mod io;
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use benchmarks::{apply_training_benchmark, get_training_benchmark, list_training_benchmarks};
 use contracts::*;
 use pinn::UniversalPinnEngine;
 use tauri::{Emitter, State};
@@ -48,6 +50,51 @@ fn parse_stage_id_from_notes(notes: &[String]) -> String {
         };
     }
     "idle".to_string()
+}
+
+fn resolve_training_mode(batch: &TrainingBatch) -> String {
+    batch.training_mode.clone().unwrap_or_else(|| {
+        if batch.benchmark_id.is_some() {
+            "benchmark".to_string()
+        } else if batch.target_loss.is_finite() && batch.target_loss > 0.0 && batch.target_loss <= 1e-8 {
+            "legacy-mixed-exact".to_string()
+        } else {
+            "production-generalized".to_string()
+        }
+    })
+}
+
+fn resolve_gate_status(running: bool, completed: bool, reached_target: bool, stop_reason: &str) -> String {
+    if running {
+        "running".to_string()
+    } else if !completed {
+        "queued".to_string()
+    } else if reached_target {
+        "passed".to_string()
+    } else if stop_reason.contains("plateau") {
+        "stalled".to_string()
+    } else if stop_reason.contains("manual") {
+        "stopped".to_string()
+    } else {
+        "failed".to_string()
+    }
+}
+
+fn dominant_blocker_from_progress(progress: &TrainingProgressEvent) -> Option<String> {
+    [
+        ("val-stress-fit", progress.val_stress_fit),
+        ("val-constitutive-normal", progress.val_constitutive_normal_residual),
+        ("val-constitutive-shear", progress.val_constitutive_shear_residual),
+        ("val-invariant", progress.val_invariant_residual),
+        ("boundary", progress.boundary_residual),
+        ("material", progress.material_residual),
+        ("kinematic", progress.kinematic_residual),
+        ("momentum", progress.momentum_residual),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.is_finite())
+    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    .and_then(|(name, value)| if value > 0.0 { Some(name.to_string()) } else { None })
 }
 
 fn model_status_from_snapshot(state: &pinn::UniversalPinnState) -> ModelStatus {
@@ -89,7 +136,13 @@ fn model_status_from_snapshot(state: &pinn::UniversalPinnState) -> ModelStatus {
     }
 }
 
-fn default_diagnostics(lr: f64, arch: Vec<usize>) -> TrainingDiagnostics {
+fn default_diagnostics(
+    lr: f64,
+    arch: Vec<usize>,
+    training_mode: String,
+    benchmark_id: Option<String>,
+    run_budget_total: usize,
+) -> TrainingDiagnostics {
     TrainingDiagnostics {
         best_val_loss: f64::MAX,
         epochs_since_improvement: 0,
@@ -134,6 +187,16 @@ fn default_diagnostics(lr: f64, arch: Vec<usize>) -> TrainingDiagnostics {
         collocation_samples_added: 0,
         train_data_size: 0,
         train_data_cap: 0,
+        training_mode,
+        benchmark_id,
+        gate_status: "queued".to_string(),
+        certified_best_metric: f64::MAX,
+        reproducibility_spread: None,
+        dominant_blocker: None,
+        stalled_reason: None,
+        benchmark_certification: None,
+        run_budget_used: 0,
+        run_budget_total,
         recent_events: vec![],
         pino: None,
     }
@@ -202,6 +265,24 @@ fn merge_training_progress(
         next.collocation_samples_added = incoming.collocation_samples_added;
         next.train_data_size = incoming.train_data_size;
         next.train_data_cap = incoming.train_data_cap;
+        if incoming.loss.is_finite() && incoming.loss > 0.0 {
+            next.loss = incoming.loss;
+        }
+        if incoming.val_loss.is_finite() && incoming.val_loss > 0.0 {
+            next.val_loss = incoming.val_loss;
+        }
+        if incoming.data_loss.is_finite() && incoming.data_loss > 0.0 {
+            next.data_loss = incoming.data_loss;
+        }
+        if incoming.physics_loss.is_finite() && incoming.physics_loss > 0.0 {
+            next.physics_loss = incoming.physics_loss;
+        }
+        if incoming.val_data_loss.is_finite() && incoming.val_data_loss > 0.0 {
+            next.val_data_loss = incoming.val_data_loss;
+        }
+        if incoming.val_physics_loss.is_finite() && incoming.val_physics_loss > 0.0 {
+            next.val_physics_loss = incoming.val_physics_loss;
+        }
         next.residual_weight_momentum = incoming.residual_weight_momentum;
         next.residual_weight_kinematics = incoming.residual_weight_kinematics;
         next.residual_weight_material = incoming.residual_weight_material;
@@ -216,6 +297,25 @@ fn merge_training_progress(
         }
         if incoming.progress_ratio > 0.0 {
             next.progress_ratio = next.progress_ratio.max(incoming.progress_ratio);
+        }
+        if !incoming.training_mode.is_empty() {
+            next.training_mode = incoming.training_mode.clone();
+        }
+        if incoming.benchmark_id.is_some() {
+            next.benchmark_id = incoming.benchmark_id.clone();
+        }
+        if !incoming.gate_status.is_empty() {
+            next.gate_status = incoming.gate_status.clone();
+        }
+        if incoming.certified_best_metric.is_finite() {
+            next.certified_best_metric =
+                next.certified_best_metric.min(incoming.certified_best_metric);
+        }
+        if incoming.dominant_blocker.is_some() {
+            next.dominant_blocker = incoming.dominant_blocker.clone();
+        }
+        if incoming.stalled_reason.is_some() {
+            next.stalled_reason = incoming.stalled_reason.clone();
         }
         next.target_band_low = incoming.target_band_low;
         next.target_band_high = incoming.target_band_high;
@@ -233,6 +333,25 @@ fn merge_training_progress(
         merged.pino = current.pino.clone();
     }
     merged
+}
+
+fn update_epochs_since_improvement(
+    best_val: &mut f64,
+    since_improve: &mut usize,
+    last_epoch_counted: &mut usize,
+    epoch: usize,
+    metric: f64,
+) {
+    if metric.is_finite() && metric > 0.0 && metric + 1e-12 < *best_val {
+        *best_val = metric;
+        *since_improve = 0;
+    } else if epoch > 0 && epoch > *last_epoch_counted {
+        *since_improve = since_improve.saturating_add(epoch - *last_epoch_counted);
+    }
+
+    if epoch > 0 {
+        *last_epoch_counted = (*last_epoch_counted).max(epoch);
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -262,7 +381,18 @@ fn start_ann_training(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<bool, String> {
+    let batch = apply_training_benchmark(batch)?;
     batch.validate()?;
+    if let Some(benchmark_id) = batch.benchmark_id.as_deref() {
+        if get_training_benchmark(benchmark_id).is_none() {
+            return Err(format!(
+                "Unknown benchmarkId '{benchmark_id}'. Call listTrainingBenchmarks for supported benchmark profiles."
+            ));
+        }
+    }
+    let training_mode = resolve_training_mode(&batch);
+    let benchmark_id = batch.benchmark_id.clone();
+    let init_total = batch.max_total_epochs.unwrap_or(batch.epochs.max(1));
     {
         let mut status = state
             .training_status
@@ -277,11 +407,16 @@ fn start_ann_training(
             completed: false,
             last_result: None,
             last_error: None,
-            diagnostics: default_diagnostics(batch.learning_rate.unwrap_or(5e-4), vec![]),
+            diagnostics: default_diagnostics(
+                batch.learning_rate.unwrap_or(5e-4),
+                vec![],
+                training_mode.clone(),
+                benchmark_id.clone(),
+                init_total,
+            ),
         };
     }
 
-    let init_total = batch.max_total_epochs.unwrap_or(batch.epochs.max(1));
     if let Ok(mut tick) = state.training_tick.lock() {
         *tick = TrainingTickEvent {
             epoch: 0,
@@ -336,6 +471,12 @@ fn start_ann_training(
             learning_rate: batch.learning_rate.unwrap_or(5e-4),
             architecture: vec![],
             progress_ratio: 0.0,
+            training_mode: training_mode.clone(),
+            benchmark_id: benchmark_id.clone(),
+            gate_status: "queued".to_string(),
+            certified_best_metric: f64::MAX,
+            dominant_blocker: None,
+            stalled_reason: None,
             network: NetworkSnapshot {
                 layer_sizes: vec![],
                 nodes: vec![],
@@ -353,11 +494,14 @@ fn start_ann_training(
     let stop_flag = state.training_stop.clone();
     let app_handle = app.clone();
     let batch_owned = batch.clone();
+    let training_mode_owned = training_mode.clone();
+    let benchmark_id_owned = benchmark_id.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let sanitize = |v: f64| if v.is_finite() { v } else { 0.0 };
         let mut best_val = f64::MAX;
         let mut since_improve = 0usize;
+        let mut last_epoch_counted = 0usize;
         let mut last_lr = batch_owned.learning_rate.unwrap_or(5e-4);
         let mut last_stage = "idle".to_string();
         let mut last_optimizer = "adamw".to_string();
@@ -397,6 +541,18 @@ fn start_ann_training(
                             trend_variance: sanitize(progress.trend_variance),
                             learning_rate: sanitize(progress.learning_rate),
                             progress_ratio: sanitize(progress.progress_ratio).clamp(0.0, 1.0),
+                            training_mode: training_mode_owned.clone(),
+                            benchmark_id: benchmark_id_owned.clone(),
+                            gate_status: "running".to_string(),
+                            certified_best_metric: if progress.certified_best_metric.is_finite()
+                                && progress.certified_best_metric > 0.0
+                            {
+                                progress.certified_best_metric
+                            } else {
+                                f64::MAX
+                            },
+                            dominant_blocker: dominant_blocker_from_progress(&progress),
+                            stalled_reason: None,
                             ..progress
                         };
                         let safe_arch = safe_progress.architecture.clone();
@@ -405,12 +561,18 @@ fn start_ann_training(
                                 merge_training_progress(&shared_progress, &safe_progress);
                         }
                         let v = sanitize(progress.val_loss);
-                        if v + 1e-12 < best_val {
-                            best_val = v;
-                            since_improve = 0;
+                        let live_metric = safe_progress.certified_best_metric.min(if v > 0.0 {
+                            v
                         } else {
-                            since_improve = since_improve.saturating_add(1);
-                        }
+                            f64::MAX
+                        });
+                        update_epochs_since_improvement(
+                            &mut best_val,
+                            &mut since_improve,
+                            &mut last_epoch_counted,
+                            safe_progress.epoch,
+                            live_metric,
+                        );
                         let lr = sanitize(progress.learning_rate);
                         last_lr = lr;
                         if let Ok(mut status) = status_state.lock() {
@@ -463,8 +625,9 @@ fn start_ann_training(
                             status.diagnostics.epochs_since_improvement = since_improve;
                             status.diagnostics.current_learning_rate = lr;
                             status.diagnostics.lr_schedule_phase = safe_progress.lr_phase.clone();
-                            status.diagnostics.active_stage = safe_progress.stage_id;
-                            status.diagnostics.active_optimizer = safe_progress.optimizer_id;
+                            status.diagnostics.active_stage = safe_progress.stage_id.clone();
+                            status.diagnostics.active_optimizer =
+                                safe_progress.optimizer_id.clone();
                             status.diagnostics.target_floor_estimate =
                                 safe_progress.target_band_low;
                             status.diagnostics.bo_selected_architecture = safe_arch;
@@ -503,7 +666,7 @@ fn start_ann_training(
                                 safe_progress.val_constitutive_normal_residual;
                             status.diagnostics.val_constitutive_shear_residual =
                                 safe_progress.val_constitutive_shear_residual;
-                            status.diagnostics.hybrid_mode = safe_progress.hybrid_mode;
+                            status.diagnostics.hybrid_mode = safe_progress.hybrid_mode.clone();
                             status.diagnostics.collocation_points =
                                 batch_owned.collocation_points.unwrap_or(4096);
                             status.diagnostics.boundary_points =
@@ -514,6 +677,16 @@ fn start_ann_training(
                                 safe_progress.collocation_samples_added;
                             status.diagnostics.train_data_size = safe_progress.train_data_size;
                             status.diagnostics.train_data_cap = safe_progress.train_data_cap;
+                            status.diagnostics.training_mode = training_mode_owned.clone();
+                            status.diagnostics.benchmark_id = benchmark_id_owned.clone();
+                            status.diagnostics.gate_status = "running".to_string();
+                            status.diagnostics.certified_best_metric = best_val;
+                            status.diagnostics.dominant_blocker =
+                                dominant_blocker_from_progress(&safe_progress);
+                            status.diagnostics.stalled_reason = None;
+                            status.diagnostics.benchmark_certification = None;
+                            status.diagnostics.run_budget_used = safe_progress.epoch;
+                            status.diagnostics.run_budget_total = safe_progress.total_epochs;
                             status.diagnostics.recent_events = recent_events.clone();
                         }
                         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -549,12 +722,37 @@ fn start_ann_training(
         match run_result {
             Ok((result, snapshot, model_status)) => {
                 let final_progress = progress_state.lock().ok().map(|p| p.clone());
+                let final_gate_status = resolve_gate_status(
+                    false,
+                    true,
+                    result.reached_target_loss,
+                    &result.stop_reason,
+                );
+                let final_dominant_blocker = final_progress
+                    .as_ref()
+                    .and_then(dominant_blocker_from_progress)
+                    .or_else(|| result.dominant_blocker.clone());
+                let final_stalled_reason = if final_gate_status == "stalled" {
+                    Some(result.stop_reason.clone())
+                } else {
+                    None
+                };
+                let enriched_result = TrainResult {
+                    training_mode: Some(training_mode_owned.clone()),
+                    benchmark_id: benchmark_id_owned.clone(),
+                    gate_status: Some(final_gate_status.clone()),
+                    certified_best_metric: Some(best_val.min(result.val_loss)),
+                    reproducibility_spread: None,
+                    dominant_blocker: final_dominant_blocker.clone(),
+                    stalled_reason: final_stalled_reason.clone(),
+                    ..result.clone()
+                };
                 if let Ok(mut status) = status_state.lock() {
                     *status = TrainingRunStatus {
                         running: false,
                         stop_requested: false,
                         completed: true,
-                        last_result: Some(result.clone()),
+                        last_result: Some(enriched_result.clone()),
                         last_error: None,
                         diagnostics: TrainingDiagnostics {
                             best_val_loss: best_val,
@@ -732,6 +930,18 @@ fn start_ann_training(
                             train_data_size: extract_metric(&result.notes, "TrainDataFinal:")
                                 .unwrap_or(0.0)
                                 as usize,
+                            training_mode: training_mode_owned.clone(),
+                            benchmark_id: benchmark_id_owned.clone(),
+                            gate_status: final_gate_status.clone(),
+                            certified_best_metric: best_val.min(enriched_result.val_loss),
+                            reproducibility_spread: None,
+                            dominant_blocker: final_dominant_blocker.clone(),
+                            stalled_reason: final_stalled_reason.clone(),
+                            benchmark_certification: enriched_result.benchmark_certification.clone(),
+                            run_budget_used: enriched_result.completed_epochs,
+                            run_budget_total: batch_owned
+                                .max_total_epochs
+                                .unwrap_or(batch_owned.epochs.max(1)),
                             recent_events: recent_events.clone(),
                             pino: result.pino.clone(),
                         },
@@ -748,7 +958,7 @@ fn start_ann_training(
                     keep_last: batch_owned.checkpoint_retention.unwrap_or(8).max(1),
                     keep_best: 2,
                 });
-                let _ = app_handle.emit("ann-training-complete", &result);
+                let _ = app_handle.emit("ann-training-complete", &enriched_result);
             }
             Err(err) => {
                 if let Ok(mut status) = status_state.lock() {
@@ -758,8 +968,17 @@ fn start_ann_training(
                         completed: true,
                         last_result: None,
                         last_error: Some(err.clone()),
-                        diagnostics: default_diagnostics(last_lr, vec![]),
+                        diagnostics: default_diagnostics(
+                            last_lr,
+                            vec![],
+                            training_mode_owned.clone(),
+                            benchmark_id_owned.clone(),
+                            batch_owned.max_total_epochs.unwrap_or(batch_owned.epochs.max(1)),
+                        ),
                     };
+                    status.diagnostics.gate_status = "failed".to_string();
+                    status.diagnostics.stalled_reason = Some(err.clone());
+                    status.diagnostics.benchmark_certification = None;
                 }
                 let _ = app_handle.emit("ann-training-error", err);
             }
@@ -782,6 +1001,11 @@ fn stop_ann_training(state: State<'_, AppState>) -> Result<bool, String> {
     } else {
         Ok(false)
     }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn list_training_benchmarks_command() -> Result<Vec<TrainingBenchmarkManifest>, String> {
+    Ok(list_training_benchmarks())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -926,6 +1150,12 @@ fn reset_ann_model(seed: Option<u64>, state: State<'_, AppState>) -> Result<Mode
             learning_rate: 0.0,
             architecture: vec![],
             progress_ratio: 0.0,
+            training_mode: "legacy-mixed-exact".to_string(),
+            benchmark_id: None,
+            gate_status: "queued".to_string(),
+            certified_best_metric: f64::MAX,
+            dominant_blocker: None,
+            stalled_reason: None,
             network: NetworkSnapshot {
                 layer_sizes: vec![],
                 nodes: vec![],
@@ -941,7 +1171,13 @@ fn reset_ann_model(seed: Option<u64>, state: State<'_, AppState>) -> Result<Mode
             completed: false,
             last_result: None,
             last_error: None,
-            diagnostics: default_diagnostics(5e-4, vec![]),
+            diagnostics: default_diagnostics(
+                5e-4,
+                vec![],
+                "legacy-mixed-exact".to_string(),
+                None,
+                0,
+            ),
         };
     }
     let model = state
@@ -1099,6 +1335,12 @@ fn main() {
                 learning_rate: 0.0,
                 architecture: vec![],
                 progress_ratio: 0.0,
+                training_mode: "legacy-mixed-exact".to_string(),
+                benchmark_id: None,
+                gate_status: "queued".to_string(),
+                certified_best_metric: f64::MAX,
+                dominant_blocker: None,
+                stalled_reason: None,
                 network: NetworkSnapshot {
                     layer_sizes: vec![],
                     nodes: vec![],
@@ -1112,7 +1354,13 @@ fn main() {
                 completed: false,
                 last_result: None,
                 last_error: None,
-                diagnostics: default_diagnostics(5e-4, vec![]),
+                diagnostics: default_diagnostics(
+                    5e-4,
+                    vec![],
+                    "legacy-mixed-exact".to_string(),
+                    None,
+                    0,
+                ),
             })),
             training_stop: Arc::new(AtomicBool::new(false)),
         })
@@ -1121,6 +1369,7 @@ fn main() {
             train_ann,
             start_ann_training,
             stop_ann_training,
+            list_training_benchmarks_command,
             get_training_status,
             infer_ann,
             run_dynamic_case,
@@ -1205,6 +1454,12 @@ mod tests {
             learning_rate: 5e-4,
             architecture: vec![15, 48, 48, 48, 11],
             progress_ratio: if epoch > 0 { epoch as f64 / 10_000.0 } else { 0.0 },
+            training_mode: "legacy-mixed-exact".to_string(),
+            benchmark_id: None,
+            gate_status: if epoch > 0 { "running".to_string() } else { "queued".to_string() },
+            certified_best_metric: if epoch > 0 { 0.30 } else { f64::MAX },
+            dominant_blocker: None,
+            stalled_reason: None,
             network: NetworkSnapshot {
                 layer_sizes: vec![],
                 nodes: vec![],
@@ -1234,5 +1489,85 @@ mod tests {
         assert!((merged.val_loss - current.val_loss).abs() <= 1e-12);
         assert_eq!(merged.lr_phase, "epoch-16-bootstrap");
         assert_eq!(merged.stage_id, "preflight");
+    }
+
+    #[test]
+    fn exact_refine_progress_preserves_epoch_but_updates_live_losses() {
+        let current = sample_progress(48, "pino-steady");
+        let mut incoming = sample_progress(0, "candidate-r1-s1-adam");
+        incoming.stage_id = "exact-refine".to_string();
+        incoming.loss = 4.176160;
+        incoming.val_loss = 3.699585;
+
+        let merged = merge_training_progress(&current, &incoming);
+        assert_eq!(merged.epoch, 48);
+        assert!((merged.loss - 4.176160).abs() <= 1e-12);
+        assert!((merged.val_loss - 3.699585).abs() <= 1e-12);
+        assert_eq!(merged.stage_id, "exact-refine");
+        assert_eq!(merged.lr_phase, "candidate-r1-s1-adam");
+    }
+
+    #[test]
+    fn epochs_since_improvement_ignores_epoch_zero_refine_frames() {
+        let mut best_val = 0.25;
+        let mut since_improve = 3usize;
+        let mut last_epoch_counted = 15usize;
+
+        update_epochs_since_improvement(
+            &mut best_val,
+            &mut since_improve,
+            &mut last_epoch_counted,
+            0,
+            f64::MAX,
+        );
+
+        assert!((best_val - 0.25).abs() <= 1e-12);
+        assert_eq!(since_improve, 3);
+        assert_eq!(last_epoch_counted, 15);
+    }
+
+    #[test]
+    fn epochs_since_improvement_counts_only_new_completed_epochs() {
+        let mut best_val = 0.25;
+        let mut since_improve = 0usize;
+        let mut last_epoch_counted = 15usize;
+
+        update_epochs_since_improvement(
+            &mut best_val,
+            &mut since_improve,
+            &mut last_epoch_counted,
+            16,
+            0.30,
+        );
+        update_epochs_since_improvement(
+            &mut best_val,
+            &mut since_improve,
+            &mut last_epoch_counted,
+            16,
+            0.31,
+        );
+
+        assert!((best_val - 0.25).abs() <= 1e-12);
+        assert_eq!(since_improve, 1);
+        assert_eq!(last_epoch_counted, 16);
+    }
+
+    #[test]
+    fn epoch_zero_certified_metric_can_improve_best_without_counting_epoch() {
+        let mut best_val = 10.0;
+        let mut since_improve = 8usize;
+        let mut last_epoch_counted = 48usize;
+
+        update_epochs_since_improvement(
+            &mut best_val,
+            &mut since_improve,
+            &mut last_epoch_counted,
+            0,
+            3.7,
+        );
+
+        assert!((best_val - 3.7).abs() <= 1e-12);
+        assert_eq!(since_improve, 0);
+        assert_eq!(last_epoch_counted, 48);
     }
 }

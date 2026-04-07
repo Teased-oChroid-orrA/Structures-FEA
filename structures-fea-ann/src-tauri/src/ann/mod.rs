@@ -329,6 +329,16 @@ impl AnnModel {
         S: FnMut() -> bool,
         C: FnMut(usize, AnnModelState, bool),
     {
+        let training_mode = batch.training_mode.clone().unwrap_or_else(|| {
+            if batch.benchmark_id.is_some() {
+                "benchmark".to_string()
+            } else if batch.target_loss.is_finite() && batch.target_loss > 0.0 && batch.target_loss <= 1e-8 {
+                "legacy-mixed-exact".to_string()
+            } else {
+                "production-generalized".to_string()
+            }
+        });
+        let benchmark_id = batch.benchmark_id.clone();
         let mut emit_preflight = |stage_id: &str,
                                   lr_phase: &str,
                                   train_data_size: usize,
@@ -381,6 +391,12 @@ impl AnnModel {
                 learning_rate,
                 architecture: architecture.to_vec(),
                 progress_ratio: 0.0,
+                training_mode: training_mode.clone(),
+                benchmark_id: benchmark_id.clone(),
+                gate_status: "queued".to_string(),
+                certified_best_metric: f64::MAX,
+                dominant_blocker: None,
+                stalled_reason: None,
                 network: NetworkSnapshot {
                     layer_sizes: vec![],
                     nodes: vec![],
@@ -1302,6 +1318,12 @@ impl AnnModel {
                         learning_rate: self.learning_rate,
                         architecture: self.layer_sizes.clone(),
                         progress_ratio: completed_epochs as f64 / max_total_epochs as f64,
+                        training_mode: training_mode.clone(),
+                        benchmark_id: benchmark_id.clone(),
+                        gate_status: "running".to_string(),
+                        certified_best_metric: val_loss,
+                        dominant_blocker: None,
+                        stalled_reason: None,
                         network: if include_snapshot {
                             self.network_snapshot()
                         } else {
@@ -1540,6 +1562,27 @@ impl AnnModel {
             last_val_breakdown.physics
         ));
 
+        let stop_reason = if reached_target {
+            if trend_converged {
+                "trend-converged".to_string()
+            } else {
+                "target-loss-reached".to_string()
+            }
+        } else if manual_stop {
+            "manual-stop".to_string()
+        } else if completed_epochs >= max_total_epochs {
+            "max-epochs-reached".to_string()
+        } else {
+            "manual-stop".to_string()
+        };
+        let gate_status = if reached_target_loss || trend_converged {
+            "passed".to_string()
+        } else if stop_reason.contains("manual") {
+            "stopped".to_string()
+        } else {
+            "failed".to_string()
+        };
+
         TrainResult {
             model_version: self.model_version,
             loss,
@@ -1552,20 +1595,16 @@ impl AnnModel {
             reached_target: reached_target_loss,
             reached_target_loss,
             reached_autonomous_convergence: trend_converged,
-            stop_reason: if reached_target {
-                if trend_converged {
-                    "trend-converged".to_string()
-                } else {
-                    "target-loss-reached".to_string()
-                }
-            } else if manual_stop {
-                "manual-stop".to_string()
-            } else if completed_epochs >= max_total_epochs {
-                "max-epochs-reached".to_string()
-            } else {
-                "manual-stop".to_string()
-            },
+            stop_reason,
             notes,
+            training_mode: Some(training_mode),
+            benchmark_id,
+            gate_status: Some(gate_status),
+            certified_best_metric: Some(val_loss),
+            reproducibility_spread: None,
+            dominant_blocker: None,
+            stalled_reason: None,
+            benchmark_certification: None,
             pino: None,
         }
     }
@@ -3753,6 +3792,8 @@ mod tests {
             cases,
             epochs: 20,
             target_loss: 1e-3,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(false),
             max_total_epochs: Some(20),
@@ -3870,6 +3911,8 @@ mod tests {
             cases: vec![SolveInput::default()],
             epochs: 20,
             target_loss: 0.0,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(false),
             max_total_epochs: Some(20),
@@ -3917,6 +3960,8 @@ mod tests {
             cases: vec![SolveInput::default()],
             epochs: 40,
             target_loss: 0.0,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(true),
             max_total_epochs: Some(s1 + s2 + s3),
@@ -3986,6 +4031,8 @@ mod tests {
             cases: vec![SolveInput::default()],
             epochs: 40,
             target_loss: 0.0,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(true),
             max_total_epochs: Some(420),
@@ -4060,6 +4107,8 @@ mod tests {
             cases: vec![SolveInput::default()],
             epochs: 40,
             target_loss: 1e-9,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(true),
             max_total_epochs: Some(5000),
@@ -4122,6 +4171,8 @@ mod tests {
             cases: vec![SolveInput::default()],
             epochs: 40,
             target_loss: 1e-9,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(true),
             max_total_epochs: Some(800_000),
@@ -4308,6 +4359,8 @@ mod tests {
             cases: vec![c],
             epochs: 30,
             target_loss: 1e-4,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(true),
             max_total_epochs: Some(1200),
@@ -4394,6 +4447,8 @@ mod tests {
             cases: vec![c],
             epochs: 30,
             target_loss: 1e-9,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(true),
             max_total_epochs: Some(1200),
@@ -4491,6 +4546,8 @@ mod tests {
             cases: vec![c],
             epochs: 40,
             target_loss: 1e-9,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(true),
             max_total_epochs: Some(10_000),
@@ -4583,6 +4640,8 @@ mod tests {
             cases: vec![c],
             epochs: 40,
             target_loss: 0.01,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(true),
             max_total_epochs: Some(10_000),

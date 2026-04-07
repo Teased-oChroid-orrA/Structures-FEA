@@ -14,6 +14,7 @@ pub const PINO_BACKEND_CANDLE_METAL: &str = "pino-candle-metal";
 pub const PINO_BACKEND_NDARRAY_CPU: &str = "pino-ndarray-cpu";
 
 pub const PINO_INPUT_CHANNELS: usize = 15;
+pub const PINO_DISPLACEMENT_OUTPUT_CHANNELS: usize = 3;
 pub const PINO_PRIMARY_OUTPUT_CHANNELS: usize = 9;
 pub const PINO_AUX_OUTPUT_CHANNELS: usize = 2;
 pub const PINO_OUTPUT_CHANNELS: usize = PINO_PRIMARY_OUTPUT_CHANNELS + PINO_AUX_OUTPUT_CHANNELS;
@@ -649,6 +650,7 @@ impl OperatorTrainableParams {
         grid_ny: usize,
         grid_nz: usize,
         spectral_modes: usize,
+        output_dim: usize,
     ) -> Vec<f64> {
         if cell_count == 0 {
             return Vec::new();
@@ -692,7 +694,8 @@ impl OperatorTrainableParams {
         let lifted = activations.clone();
         let spectral_projection =
             Self::spectral_projection_matrix(grid_nx, grid_ny, grid_nz, spectral_modes);
-        let mut outputs = vec![0.0; cell_count * PINO_OUTPUT_CHANNELS];
+        let output_dim = output_dim.max(1);
+        let mut outputs = vec![0.0; cell_count * output_dim];
         for layer in 0..hidden_layers {
             let self_weight_len = hidden_width * hidden_width;
             let local_weight_len = hidden_width * hidden_width;
@@ -770,7 +773,7 @@ impl OperatorTrainableParams {
         }
         for cell_idx in 0..cell_count {
             let local_hidden = &activations[cell_idx * hidden_width..(cell_idx + 1) * hidden_width];
-            for channel in 0..PINO_OUTPUT_CHANNELS {
+            for channel in 0..output_dim {
                 let output_start = weight_offset + channel * hidden_width;
                 let output_end = output_start + hidden_width;
                 let dot = self.field_head_weights[output_start..output_end]
@@ -783,7 +786,7 @@ impl OperatorTrainableParams {
                     .get(bias_offset + channel)
                     .copied()
                     .unwrap_or(0.0);
-                outputs[cell_idx * PINO_OUTPUT_CHANNELS + channel] =
+                outputs[cell_idx * output_dim + channel] =
                     Self::soft_clip(dot + bias, 2.5);
             }
         }
@@ -799,6 +802,13 @@ pub struct PinoModelConfig {
     pub hidden_layers: usize,
     pub hidden_width: usize,
     pub operator_grid: OperatorGridSpec,
+}
+
+fn benchmark_output_channels(benchmark_id: Option<&str>) -> usize {
+    match benchmark_id {
+        Some("benchmark_cantilever_2d") => PINO_DISPLACEMENT_OUTPUT_CHANNELS,
+        _ => PINO_OUTPUT_CHANNELS,
+    }
 }
 
 pub fn is_pino_backend(name: &str) -> bool {
@@ -820,18 +830,30 @@ pub fn canonical_backend_name(name: Option<&str>) -> String {
     }
 }
 
+fn preserve_single_layer_nz(base_nz: usize, scaled: usize, min_nz: usize, max_nz: usize) -> usize {
+    if base_nz <= 1 {
+        1
+    } else {
+        scaled.clamp(min_nz.max(2), max_nz.max(min_nz.max(2)))
+    }
+}
+
 pub fn operator_grid_spec(input: &SolveInput) -> OperatorGridSpec {
     OperatorGridSpec {
         nx: input.mesh.nx.clamp(12, 48),
         ny: input.mesh.ny.clamp(8, 32),
-        nz: input.mesh.nz.clamp(2, 8),
+        nz: if input.mesh.nz <= 1 {
+            1
+        } else {
+            input.mesh.nz.clamp(2, 8)
+        },
         input_channels: PINO_INPUT_CHANNELS,
         output_channels: PINO_OUTPUT_CHANNELS,
     }
 }
 
 pub fn model_config(batch: &TrainingBatch) -> PinoModelConfig {
-    let operator_grid = batch
+    let mut operator_grid = batch
         .cases
         .first()
         .map(operator_grid_spec)
@@ -842,6 +864,7 @@ pub fn model_config(batch: &TrainingBatch) -> PinoModelConfig {
             input_channels: PINO_INPUT_CHANNELS,
             output_channels: PINO_OUTPUT_CHANNELS,
         });
+    operator_grid.output_channels = benchmark_output_channels(batch.benchmark_id.as_deref());
     let boundary_budget = batch.boundary_points.unwrap_or(1024).max(16);
     let interface_budget = batch.interface_points.unwrap_or(512).max(16);
     let low_target_mode =
@@ -999,7 +1022,8 @@ pub fn build_operator_field_head_batch(
     let mut von_mises = Vec::with_capacity(cell_count);
     let mut max_principal = Vec::with_capacity(cell_count);
     let mut features = Vec::with_capacity(cell_count * PINO_FIELD_HEAD_BASIS);
-    let mut correction_scales = Vec::with_capacity(cell_count * PINO_OUTPUT_CHANNELS);
+    let output_dim = config.operator_grid.output_channels.clamp(1, PINO_OUTPUT_CHANNELS);
+    let mut correction_scales = Vec::with_capacity(cell_count * output_dim);
     let mut mask_values = Vec::with_capacity(cell_count);
     let mut clamp_values = Vec::with_capacity(cell_count);
     let mut displacement_embed = Vec::with_capacity(cell_count);
@@ -1051,6 +1075,7 @@ pub fn build_operator_field_head_batch(
         .abs()
         .max(vm_scale * 0.5)
         .max(1.0);
+    let plane_stress_2d = config.operator_grid.nz <= 1;
     let thickness_norm = input.geometry.thickness_in.abs().max(1e-6);
     let e_norm = input.material.e_psi.abs().max(1.0);
     let axial_load_norm = input.load.axial_load_lbf.abs().max(1.0);
@@ -1118,11 +1143,15 @@ pub fn build_operator_field_head_batch(
         } else {
             0.0
         };
-        let poisson_thickness = -input.material.nu
-            * (axial_sigma / e)
-            * (z - 0.5)
-            * input.geometry.thickness_in
-            * xi;
+        let poisson_thickness = if plane_stress_2d {
+            0.0
+        } else {
+            -input.material.nu
+                * (axial_sigma / e)
+                * (z - 0.5)
+                * input.geometry.thickness_in
+                * xi
+        };
         let dx_center = x - 0.5;
         let dy_center = y - 0.5;
         let radial_center = (dx_center * dx_center + dy_center * dy_center).sqrt();
@@ -1188,7 +1217,7 @@ pub fn build_operator_field_head_batch(
             embed_feature * edge_symmetry_z,
         ];
         features.extend_from_slice(&field_features);
-        correction_scales.extend_from_slice(&[
+        let full_correction_scales = [
             mask * displacement_factor * ux_scale,
             mask * displacement_factor * uy_scale,
             mask * displacement_factor * uz_scale,
@@ -1200,7 +1229,8 @@ pub fn build_operator_field_head_batch(
             mask * syz_scale,
             mask * vm_scale,
             mask * principal_scale,
-        ]);
+        ];
+        correction_scales.extend_from_slice(&full_correction_scales[..output_dim]);
         mask_values.push(mask);
         clamp_values.push(fixed_feature);
         displacement_embed.push(mask * displacement_factor);
@@ -1213,20 +1243,40 @@ pub fn build_operator_field_head_batch(
         let uy_base = mask
             * (tip_deflection * deflection_shape * (1.0 + 0.10 * hole_decay)
                 + poisson_contraction * (1.0 + 0.20 * hole_decay));
-        let uz_base = mask * poisson_thickness * (1.0 + 0.10 * hole_decay);
+        let uz_base = if plane_stress_2d {
+            0.0
+        } else {
+            mask * poisson_thickness * (1.0 + 0.10 * hole_decay)
+        };
         let sxx_base = mask
             * ((axial_sigma * hole_concentration)
                 + bending_sigma * bending_shape);
-        let syy_base = mask
-            * (input.material.nu * axial_sigma.abs() * (hole_concentration - 1.0) * 0.35)
-            * axial_sigma.signum();
-        let szz_base = -input.material.nu * (sxx_base + syy_base) * 0.35;
+        let syy_base = if plane_stress_2d {
+            0.0
+        } else {
+            mask
+                * (input.material.nu * axial_sigma.abs() * (hole_concentration - 1.0) * 0.35)
+                * axial_sigma.signum()
+        };
+        let szz_base = if plane_stress_2d {
+            0.0
+        } else {
+            -input.material.nu * (sxx_base + syy_base) * 0.35
+        };
         let sxy_base = mask * shear_sigma * shear_shape;
-        let sxz_base = mask * vertical_load * input.geometry.length_in / iy.max(1e-9)
-            * through_thickness
-            * zeta
-            * 0.01;
-        let syz_base = mask * shear_sigma * through_thickness * zeta * 0.15;
+        let sxz_base = if plane_stress_2d {
+            0.0
+        } else {
+            mask * vertical_load * input.geometry.length_in / iy.max(1e-9)
+                * through_thickness
+                * zeta
+                * 0.01
+        };
+        let syz_base = if plane_stress_2d {
+            0.0
+        } else {
+            mask * shear_sigma * through_thickness * zeta * 0.15
+        };
         let mean_stress = (sxx_base + syy_base + szz_base) / 3.0;
         let deviatoric = ((sxx_base - mean_stress).powi(2)
             + (syy_base - mean_stress).powi(2)
@@ -1277,7 +1327,7 @@ pub fn build_operator_field_head_batch(
         displacement_embed,
         cell_count,
         feature_dim: PINO_FIELD_HEAD_BASIS,
-        output_dim: PINO_OUTPUT_CHANNELS,
+        output_dim,
     }
 }
 
@@ -1301,42 +1351,54 @@ pub fn build_operator_prediction_with_params(
         config.operator_grid.ny,
         config.operator_grid.nz,
         config.spectral_modes,
+        batch.output_dim,
     );
     for idx in 0..batch.cell_count {
         let scale_start = idx * batch.output_dim;
         let scales = &batch.correction_scales[scale_start..scale_start + batch.output_dim];
-        let output_start = idx * PINO_OUTPUT_CHANNELS;
+        let output_start = idx * batch.output_dim;
         prediction.ux[idx] += scales[0] * head_values[output_start];
-        prediction.uy[idx] += scales[1] * head_values[output_start + 1];
-        prediction.uz[idx] += scales[2] * head_values[output_start + 2];
-        prediction.sxx[idx] += scales[3] * head_values[output_start + 3];
-        prediction.syy[idx] += scales[4] * head_values[output_start + 4];
-        prediction.szz[idx] += scales[5] * head_values[output_start + 5];
-        prediction.sxy[idx] += scales[6] * head_values[output_start + 6];
-        prediction.sxz[idx] += scales[7] * head_values[output_start + 7];
-        prediction.syz[idx] += scales[8] * head_values[output_start + 8];
-        let mean_stress = (prediction.sxx[idx] + prediction.syy[idx] + prediction.szz[idx]) / 3.0;
-        let dev = ((prediction.sxx[idx] - mean_stress).powi(2)
-            + (prediction.syy[idx] - mean_stress).powi(2)
-            + (prediction.szz[idx] - mean_stress).powi(2)
-            + 2.0
-                * (prediction.sxy[idx].powi(2)
-                    + prediction.sxz[idx].powi(2)
-                    + prediction.syz[idx].powi(2)))
-            / 6.0;
-        prediction.max_principal[idx] = mean_stress + (2.0 * dev.max(1e-12)).sqrt();
-        prediction.von_mises[idx] = (0.5
-            * ((prediction.sxx[idx] - prediction.syy[idx]).powi(2)
-                + (prediction.syy[idx] - prediction.szz[idx]).powi(2)
-                + (prediction.szz[idx] - prediction.sxx[idx]).powi(2))
-            + 3.0
-                * (prediction.sxy[idx].powi(2)
-                    + prediction.sxz[idx].powi(2)
-                    + prediction.syz[idx].powi(2)))
-        .max(0.0)
-        .sqrt();
+        if batch.output_dim >= 2 {
+            prediction.uy[idx] += scales[1] * head_values[output_start + 1];
+        }
+        if batch.output_dim >= 3 {
+            prediction.uz[idx] += scales[2] * head_values[output_start + 2];
+        }
+        if batch.output_dim > PINO_DISPLACEMENT_OUTPUT_CHANNELS {
+            prediction.sxx[idx] += scales[3] * head_values[output_start + 3];
+            prediction.syy[idx] += scales[4] * head_values[output_start + 4];
+            prediction.szz[idx] += scales[5] * head_values[output_start + 5];
+            prediction.sxy[idx] += scales[6] * head_values[output_start + 6];
+            prediction.sxz[idx] += scales[7] * head_values[output_start + 7];
+            prediction.syz[idx] += scales[8] * head_values[output_start + 8];
+            let mean_stress =
+                (prediction.sxx[idx] + prediction.syy[idx] + prediction.szz[idx]) / 3.0;
+            let dev = ((prediction.sxx[idx] - mean_stress).powi(2)
+                + (prediction.syy[idx] - mean_stress).powi(2)
+                + (prediction.szz[idx] - mean_stress).powi(2)
+                + 2.0
+                    * (prediction.sxy[idx].powi(2)
+                        + prediction.sxz[idx].powi(2)
+                        + prediction.syz[idx].powi(2)))
+                / 6.0;
+            prediction.max_principal[idx] = mean_stress + (2.0 * dev.max(1e-12)).sqrt();
+            prediction.von_mises[idx] = (0.5
+                * ((prediction.sxx[idx] - prediction.syy[idx]).powi(2)
+                    + (prediction.syy[idx] - prediction.szz[idx]).powi(2)
+                    + (prediction.szz[idx] - prediction.sxx[idx]).powi(2))
+                + 3.0
+                    * (prediction.sxy[idx].powi(2)
+                        + prediction.sxz[idx].powi(2)
+                        + prediction.syz[idx].powi(2)))
+            .max(0.0)
+            .sqrt();
+        }
     }
-    prediction
+    if batch.output_dim == PINO_DISPLACEMENT_OUTPUT_CHANNELS {
+        reconstruct_prediction_linear_elastic_from_displacement(input, &prediction)
+    } else {
+        prediction
+    }
 }
 
 pub fn apply_operator_calibration(
@@ -1375,6 +1437,21 @@ pub fn apply_operator_calibration(
     }
     for value in &mut prediction.max_principal {
         *value *= calibration.stress_scale;
+    }
+}
+
+pub fn apply_operator_displacement_calibration(
+    prediction: &mut OperatorPrediction,
+    calibration: &OperatorCalibration,
+) {
+    for value in &mut prediction.ux {
+        *value *= calibration.displacement_scale;
+    }
+    for value in &mut prediction.uy {
+        *value *= calibration.displacement_scale;
+    }
+    for value in &mut prediction.uz {
+        *value *= calibration.displacement_scale;
     }
 }
 
@@ -1540,7 +1617,7 @@ fn solve_case_for_operator(case: &SolveInput) -> FemResult {
     let mut reduced = case.clone();
     reduced.mesh.nx = reduced.mesh.nx.clamp(8, 16);
     reduced.mesh.ny = reduced.mesh.ny.clamp(6, 12);
-    reduced.mesh.nz = reduced.mesh.nz.clamp(2, 4);
+    reduced.mesh.nz = preserve_single_layer_nz(reduced.mesh.nz, reduced.mesh.nz, 2, 4);
     reduced.mesh.amr_enabled = false;
     reduced.mesh.amr_passes = 0;
     solve_case(&reduced)
@@ -1642,6 +1719,9 @@ fn prediction_from_fem_with_grid_mode(
     } else {
         fem.stress_tensor[0][0]
     };
+    let plane_stress_2d = grid.nz <= 1;
+    let displacement_primary_benchmark =
+        grid.output_channels == PINO_DISPLACEMENT_OUTPUT_CHANNELS && hole_radius <= 0.0;
     let hole_center_x = input.geometry.length_in * 0.5;
     let hole_center_y = input.geometry.width_in * 0.5;
     for k in 0..grid.nz {
@@ -1651,12 +1731,20 @@ fn prediction_from_fem_with_grid_mode(
                 let py = normalized_axis(j, grid.ny) * input.geometry.width_in;
                 let pz = normalized_axis(k, grid.nz) * input.geometry.thickness_in;
                 let nearest = nearest_displacement(&fem.nodal_displacements, px, py, pz);
+                let interpolated = if displacement_primary_benchmark {
+                    interpolated_displacement(&fem.nodal_displacements, px, py, pz)
+                } else {
+                    nearest.clone()
+                };
                 let station = interpolate_station(&fem.beam_stations, px);
                 let through_width = if input.geometry.width_in.abs() <= 1e-9 {
                     0.5
                 } else {
                     (py / input.geometry.width_in).clamp(0.0, 1.0)
                 };
+                let target_ux = interpolated.ux_in;
+                let target_uy = interpolated.uy_in;
+                let target_uz = if plane_stress_2d { 0.0 } else { interpolated.uz_in };
                 let (sigma_x, sigma_y, sigma_z, shear_xy, shear_xz, shear_yz) =
                     if exact_hole_projection && hole_radius > 0.0 {
                         let dx = px - hole_center_x;
@@ -1730,16 +1818,28 @@ fn prediction_from_fem_with_grid_mode(
                         sigma_x *= stress_gain;
                         sigma_y *= stress_gain;
                         shear_xy *= stress_gain;
-                        let sigma_z = (-input.material.nu * (sigma_x + sigma_y)
-                            * (0.14 + 0.10 * thickness_focus))
-                            .clamp(-vm_target * 0.65, vm_target * 0.65);
+                        let sigma_z = if plane_stress_2d {
+                            0.0
+                        } else {
+                            (-input.material.nu * (sigma_x + sigma_y)
+                                * (0.14 + 0.10 * thickness_focus))
+                                .clamp(-vm_target * 0.65, vm_target * 0.65)
+                        };
                         let zeta = 2.0 * normalized_axis(k, grid.nz) - 1.0;
-                        let shear_xz = fem.stress_tensor[0][2]
-                            * zeta
-                            * (0.22 + 0.78 * inner_ring_focus * thickness_focus);
-                        let shear_yz = fem.stress_tensor[1][2]
-                            * zeta
-                            * (0.22 + 0.78 * inner_ring_focus * thickness_focus);
+                        let shear_xz = if plane_stress_2d {
+                            0.0
+                        } else {
+                            fem.stress_tensor[0][2]
+                                * zeta
+                                * (0.22 + 0.78 * inner_ring_focus * thickness_focus)
+                        };
+                        let shear_yz = if plane_stress_2d {
+                            0.0
+                        } else {
+                            fem.stress_tensor[1][2]
+                                * zeta
+                                * (0.22 + 0.78 * inner_ring_focus * thickness_focus)
+                        };
                         (sigma_x, sigma_y, sigma_z, shear_xy, shear_xz, shear_yz)
                     } else if let Some(base) = hole_target_base.as_ref() {
                         let base_vm = base.von_mises.get(ux.len()).copied().unwrap_or(0.0).abs().max(1e-6);
@@ -1764,11 +1864,23 @@ fn prediction_from_fem_with_grid_mode(
                             fem.stress_tensor[0][1]
                         };
                         let sigma_y = fem.stress_tensor[1][1];
-                        let sigma_z = fem.stress_tensor[2][2];
-                        let shear_xz =
-                            fem.stress_tensor[0][2] * (2.0 * normalized_axis(k, grid.nz) - 1.0);
-                        let shear_yz =
-                            fem.stress_tensor[1][2] * (2.0 * normalized_axis(k, grid.nz) - 1.0);
+                        let sigma_z = if plane_stress_2d {
+                            0.0
+                        } else {
+                            fem.stress_tensor[2][2]
+                        };
+                        let shear_xz = if plane_stress_2d {
+                            0.0
+                        } else {
+                            fem.stress_tensor[0][2]
+                                * (2.0 * normalized_axis(k, grid.nz) - 1.0)
+                        };
+                        let shear_yz = if plane_stress_2d {
+                            0.0
+                        } else {
+                            fem.stress_tensor[1][2]
+                                * (2.0 * normalized_axis(k, grid.nz) - 1.0)
+                        };
                         (sigma_x, sigma_y, sigma_z, shear_xy, shear_xz, shear_yz)
                     };
                 let stress_tensor = [
@@ -1777,19 +1889,26 @@ fn prediction_from_fem_with_grid_mode(
                     [shear_xz, shear_yz, sigma_z],
                 ];
                 let principal = principal_stresses(stress_tensor);
-                let vm = nearest.vm_psi.abs().max(
-                    (0.5
-                        * ((sigma_x - sigma_y).powi(2)
-                            + (sigma_y - sigma_z).powi(2)
-                            + (sigma_z - sigma_x).powi(2))
-                        + 3.0 * (shear_xy.powi(2) + shear_xz.powi(2) + shear_yz.powi(2)))
-                    .max(0.0)
-                    .sqrt(),
-                );
-                let principal_max = principal[0].abs().max(vm);
-                ux.push(nearest.ux_in);
-                uy.push(nearest.uy_in);
-                uz.push(nearest.uz_in);
+                let vm_calc = (0.5
+                    * ((sigma_x - sigma_y).powi(2)
+                        + (sigma_y - sigma_z).powi(2)
+                        + (sigma_z - sigma_x).powi(2))
+                    + 3.0 * (shear_xy.powi(2) + shear_xz.powi(2) + shear_yz.powi(2)))
+                .max(0.0)
+                .sqrt();
+                let vm = if plane_stress_2d {
+                    vm_calc
+                } else {
+                    nearest.vm_psi.abs().max(vm_calc)
+                };
+                let principal_max = if plane_stress_2d {
+                    principal[0]
+                } else {
+                    principal[0].abs().max(vm)
+                };
+                ux.push(target_ux);
+                uy.push(target_uy);
+                uz.push(target_uz);
                 sxx.push(sigma_x);
                 syy.push(sigma_y);
                 szz.push(sigma_z);
@@ -1802,7 +1921,7 @@ fn prediction_from_fem_with_grid_mode(
         }
     }
 
-    OperatorPrediction {
+    let prediction = OperatorPrediction {
         grid,
         ux,
         uy,
@@ -1815,6 +1934,12 @@ fn prediction_from_fem_with_grid_mode(
         syz,
         von_mises,
         max_principal,
+    };
+
+    if prediction.grid.output_channels == PINO_DISPLACEMENT_OUTPUT_CHANNELS {
+        reconstruct_prediction_linear_elastic_from_displacement(input, &prediction)
+    } else {
+        prediction
     }
 }
 
@@ -1930,6 +2055,229 @@ pub fn decode_prediction(input: &SolveInput, prediction: &OperatorPrediction) ->
     }
 }
 
+fn axis_derivative_from_grid(
+    values: &[f64],
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    i: usize,
+    j: usize,
+    k: usize,
+    axis: usize,
+    spacing: f64,
+) -> f64 {
+    let plane = nx * ny;
+    let index = |ii: usize, jj: usize, kk: usize| kk * plane + jj * nx + ii;
+    let h = spacing.max(1.0e-9);
+    match axis {
+        0 => {
+            if nx <= 1 {
+                0.0
+            } else if i == 0 {
+                if nx >= 3 {
+                    (-3.0 * values[index(0, j, k)]
+                        + 4.0 * values[index(1, j, k)]
+                        - values[index(2, j, k)])
+                        / (2.0 * h)
+                } else {
+                    (values[index(1.min(nx - 1), j, k)] - values[index(0, j, k)]) / h
+                }
+            } else if i + 1 == nx {
+                if nx >= 3 {
+                    (3.0 * values[index(i, j, k)]
+                        - 4.0 * values[index(i - 1, j, k)]
+                        + values[index(i - 2, j, k)])
+                        / (2.0 * h)
+                } else {
+                    (values[index(i, j, k)] - values[index(i - 1, j, k)]) / h
+                }
+            } else {
+                (values[index(i + 1, j, k)] - values[index(i - 1, j, k)]) / (2.0 * h)
+            }
+        }
+        1 => {
+            if ny <= 1 {
+                0.0
+            } else if j == 0 {
+                if ny >= 3 {
+                    (-3.0 * values[index(i, 0, k)]
+                        + 4.0 * values[index(i, 1, k)]
+                        - values[index(i, 2, k)])
+                        / (2.0 * h)
+                } else {
+                    (values[index(i, 1.min(ny - 1), k)] - values[index(i, 0, k)]) / h
+                }
+            } else if j + 1 == ny {
+                if ny >= 3 {
+                    (3.0 * values[index(i, j, k)]
+                        - 4.0 * values[index(i, j - 1, k)]
+                        + values[index(i, j - 2, k)])
+                        / (2.0 * h)
+                } else {
+                    (values[index(i, j, k)] - values[index(i, j - 1, k)]) / h
+                }
+            } else {
+                (values[index(i, j + 1, k)] - values[index(i, j - 1, k)]) / (2.0 * h)
+            }
+        }
+        _ => {
+            if nz <= 1 {
+                0.0
+            } else if k == 0 {
+                if nz >= 3 {
+                    (-3.0 * values[index(i, j, 0)]
+                        + 4.0 * values[index(i, j, 1)]
+                        - values[index(i, j, 2)])
+                        / (2.0 * h)
+                } else {
+                    (values[index(i, j, 1.min(nz - 1))] - values[index(i, j, 0)]) / h
+                }
+            } else if k + 1 == nz {
+                if nz >= 3 {
+                    (3.0 * values[index(i, j, k)]
+                        - 4.0 * values[index(i, j, k - 1)]
+                        + values[index(i, j, k - 2)])
+                        / (2.0 * h)
+                } else {
+                    (values[index(i, j, k)] - values[index(i, j, k - 1)]) / h
+                }
+            } else {
+                (values[index(i, j, k + 1)] - values[index(i, j, k - 1)]) / (2.0 * h)
+            }
+        }
+    }
+}
+
+pub fn reconstruct_prediction_linear_elastic_from_displacement(
+    input: &SolveInput,
+    prediction: &OperatorPrediction,
+) -> OperatorPrediction {
+    let nx = prediction.grid.nx;
+    let ny = prediction.grid.ny;
+    let nz = prediction.grid.nz;
+    let cells = nx * ny * nz;
+    if cells == 0 {
+        return prediction.clone();
+    }
+    let dx = input.geometry.length_in / nx.saturating_sub(1).max(1) as f64;
+    let dy = input.geometry.width_in / ny.saturating_sub(1).max(1) as f64;
+    let dz = input.geometry.thickness_in / nz.saturating_sub(1).max(1) as f64;
+    let plane_stress_2d = nz <= 1;
+    let lambda = input.material.e_psi * input.material.nu
+        / ((1.0 + input.material.nu) * (1.0 - 2.0 * input.material.nu)).max(1.0e-9);
+    let shear = input.material.e_psi / (2.0 * (1.0 + input.material.nu)).max(1.0e-9);
+    let plane_stress_c = input.material.e_psi / (1.0 - input.material.nu * input.material.nu).max(1.0e-9);
+    let mut rebuilt = prediction.clone();
+    rebuilt.sxx = vec![0.0; cells];
+    rebuilt.syy = vec![0.0; cells];
+    rebuilt.szz = vec![0.0; cells];
+    rebuilt.sxy = vec![0.0; cells];
+    rebuilt.sxz = vec![0.0; cells];
+    rebuilt.syz = vec![0.0; cells];
+    rebuilt.von_mises = vec![0.0; cells];
+    rebuilt.max_principal = vec![0.0; cells];
+    for k in 0..nz {
+        for j in 0..ny {
+            for i in 0..nx {
+                let idx = k * nx * ny + j * nx + i;
+                let dux_dx =
+                    axis_derivative_from_grid(&prediction.ux, nx, ny, nz, i, j, k, 0, dx);
+                let dux_dy =
+                    axis_derivative_from_grid(&prediction.ux, nx, ny, nz, i, j, k, 1, dy);
+                let dux_dz =
+                    axis_derivative_from_grid(&prediction.ux, nx, ny, nz, i, j, k, 2, dz);
+                let duy_dx =
+                    axis_derivative_from_grid(&prediction.uy, nx, ny, nz, i, j, k, 0, dx);
+                let duy_dy =
+                    axis_derivative_from_grid(&prediction.uy, nx, ny, nz, i, j, k, 1, dy);
+                let duy_dz =
+                    axis_derivative_from_grid(&prediction.uy, nx, ny, nz, i, j, k, 2, dz);
+                let duz_dx =
+                    axis_derivative_from_grid(&prediction.uz, nx, ny, nz, i, j, k, 0, dx);
+                let duz_dy =
+                    axis_derivative_from_grid(&prediction.uz, nx, ny, nz, i, j, k, 1, dy);
+                let duz_dz =
+                    axis_derivative_from_grid(&prediction.uz, nx, ny, nz, i, j, k, 2, dz);
+                let exx = dux_dx;
+                let eyy = duy_dy;
+                let ezz = duz_dz;
+                let gxy = dux_dy + duy_dx;
+                let gxz = dux_dz + duz_dx;
+                let gyz = duy_dz + duz_dy;
+                let (sxx, syy, szz, sxy, sxz, syz) = if plane_stress_2d {
+                    (
+                        plane_stress_c * (exx + input.material.nu * eyy),
+                        plane_stress_c * (eyy + input.material.nu * exx),
+                        0.0,
+                        shear * gxy,
+                        0.0,
+                        0.0,
+                    )
+                } else {
+                    let trace = exx + eyy + ezz;
+                    (
+                        2.0 * shear * exx + lambda * trace,
+                        2.0 * shear * eyy + lambda * trace,
+                        2.0 * shear * ezz + lambda * trace,
+                        shear * gxy,
+                        shear * gxz,
+                        shear * gyz,
+                    )
+                };
+                rebuilt.sxx[idx] = sxx;
+                rebuilt.syy[idx] = syy;
+                rebuilt.szz[idx] = szz;
+                rebuilt.sxy[idx] = sxy;
+                rebuilt.sxz[idx] = sxz;
+                rebuilt.syz[idx] = syz;
+                let principal = principal_stresses([
+                    [sxx, sxy, sxz],
+                    [sxy, syy, syz],
+                    [sxz, syz, szz],
+                ]);
+                rebuilt.max_principal[idx] = principal[0];
+                rebuilt.von_mises[idx] = ((0.5
+                    * ((sxx - syy).powi(2) + (syy - szz).powi(2) + (szz - sxx).powi(2))
+                    + 3.0 * (sxy.powi(2) + sxz.powi(2) + syz.powi(2)))
+                    .max(0.0))
+                .sqrt();
+            }
+        }
+    }
+    rebuilt
+}
+
+pub fn reconstruct_prediction_linear_elastic_from_displacement_smoothed(
+    input: &SolveInput,
+    prediction: &OperatorPrediction,
+) -> OperatorPrediction {
+    let nx = prediction.grid.nx;
+    let ny = prediction.grid.ny;
+    let nz = prediction.grid.nz;
+    if nz > 1 || nx < 3 || ny < 3 {
+        return reconstruct_prediction_linear_elastic_from_displacement(input, prediction);
+    }
+    let mut smoothed = prediction.clone();
+    let smooth_channel = |values: &[f64]| -> Vec<f64> {
+        let mut out = values.to_vec();
+        for j in 1..ny.saturating_sub(1) {
+            for i in 1..nx.saturating_sub(1) {
+                let idx = j * nx + i;
+                let left = values[idx - 1];
+                let right = values[idx + 1];
+                let up = values[idx - nx];
+                let down = values[idx + nx];
+                out[idx] = values[idx] * 0.5 + (left + right + up + down) * 0.125;
+            }
+        }
+        out
+    };
+    smoothed.ux = smooth_channel(&prediction.ux);
+    smoothed.uy = smooth_channel(&prediction.uy);
+    smoothed.uz = smooth_channel(&prediction.uz);
+    reconstruct_prediction_linear_elastic_from_displacement(input, &smoothed)
+}
+
 pub fn default_holdout_validation(batch: &TrainingBatch) -> HoldoutValidationSummary {
     HoldoutValidationSummary {
         trusted: false,
@@ -2037,23 +2385,33 @@ pub fn runtime_metadata(
         ny: input.mesh.ny.clamp(8, 32),
         nz: input.mesh.nz.clamp(1, 12),
         input_channels: PINO_INPUT_CHANNELS,
-        output_channels: PINO_OUTPUT_CHANNELS,
+        output_channels: config.operator_grid.output_channels,
     });
     let requested_nz = requested_grid_3d.as_ref().map(|grid| grid.nz).unwrap_or(1);
+    let displacement_primary_benchmark =
+        matches!(batch.benchmark_id.as_deref(), Some("benchmark_cantilever_2d"));
     PinoRuntimeMetadata {
         engine_id: PINO_ENGINE_ID.to_string(),
         backend: config.backend,
         spectral_modes: config.spectral_modes,
         operator_grid: config.operator_grid.clone(),
-        domain_dim: 3,
-        physics_model: "navier-cauchy-3d-linear-elastic".to_string(),
+        domain_dim: if displacement_primary_benchmark { 2 } else { 3 },
+        physics_model: if displacement_primary_benchmark {
+            "plane-stress-2d-displacement-primary-linear-elastic".to_string()
+        } else {
+            "navier-cauchy-3d-linear-elastic".to_string()
+        },
         spectral_modes_3d: [
             config.spectral_modes,
             config.spectral_modes,
             requested_nz.min(config.spectral_modes.max(1)),
         ],
         operator_grid_3d: requested_grid_3d,
-        boundary_mode: Some("embedded-dirichlet-3d".to_string()),
+        boundary_mode: Some(if displacement_primary_benchmark {
+            "embedded-dirichlet-2d".to_string()
+        } else {
+            "embedded-dirichlet-3d".to_string()
+        }),
         objective_mode: Some("mixed-strong-energy-linear-elastic-3d".to_string()),
         local_refinement: Some(PinoLocalRefinementMetadata {
             enabled: matches!(
@@ -2114,6 +2472,55 @@ fn interpolate_station<'a>(stations: &'a [BeamStationResult], x: f64) -> &'a Bea
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap_or(&stations[0])
+}
+
+fn interpolated_displacement(
+    nodes: &[NodalDisplacement],
+    x: f64,
+    y: f64,
+    z: f64,
+) -> NodalDisplacement {
+    if nodes.is_empty() {
+        return DEFAULT_NODAL_DISPLACEMENT;
+    }
+    let mut nearest = nodes
+        .iter()
+        .map(|node| {
+            let dist2 = (node.x_in - x).powi(2) + (node.y_in - y).powi(2) + (node.z_in - z).powi(2);
+            (dist2, node)
+        })
+        .collect::<Vec<_>>();
+    nearest.sort_by(|lhs, rhs| lhs.0.partial_cmp(&rhs.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut weight_sum = 0.0;
+    let mut ux = 0.0;
+    let mut uy = 0.0;
+    let mut uz = 0.0;
+    let mut vm = 0.0;
+    for (dist2, node) in nearest.into_iter().take(8) {
+        let weight = 1.0 / dist2.max(1.0e-12);
+        weight_sum += weight;
+        ux += node.ux_in * weight;
+        uy += node.uy_in * weight;
+        uz += node.uz_in * weight;
+        vm += node.vm_psi * weight;
+    }
+    if weight_sum <= 0.0 {
+        return DEFAULT_NODAL_DISPLACEMENT;
+    }
+    let ux = ux / weight_sum;
+    let uy = uy / weight_sum;
+    let uz = uz / weight_sum;
+    NodalDisplacement {
+        node_id: 0,
+        x_in: x,
+        y_in: y,
+        z_in: z,
+        ux_in: ux,
+        uy_in: uy,
+        uz_in: uz,
+        disp_mag_in: (ux * ux + uy * uy + uz * uz).sqrt(),
+        vm_psi: vm / weight_sum,
+    }
 }
 
 const DEFAULT_BEAM_STATION: BeamStationResult = BeamStationResult {
@@ -2259,12 +2666,17 @@ fn recipe_anchor_case(batch: &TrainingBatch) -> Option<&SolveInput> {
     batch.cases.get(anchor_idx).or_else(|| batch.cases.first())
 }
 
-fn build_seed_cases(base: &SolveInput) -> [SolveInput; PINO_RECIPE_SEED_COUNT] {
+pub(crate) fn build_seed_cases(base: &SolveInput) -> [SolveInput; PINO_RECIPE_SEED_COUNT] {
     let mut seed_low = base.clone();
     seed_low.geometry.length_in = (base.geometry.length_in * 0.90).clamp(4.0, 30.0);
     seed_low.geometry.width_in = (base.geometry.width_in * 1.10).clamp(1.0, 12.0);
     seed_low.geometry.thickness_in = (base.geometry.thickness_in * 0.90).clamp(0.03, 0.75);
-    seed_low.mesh.nz = ((base.mesh.nz as f64) * 0.9).round().clamp(2.0, 16.0) as usize;
+    seed_low.mesh.nz = preserve_single_layer_nz(
+        base.mesh.nz,
+        ((base.mesh.nz as f64) * 0.9).round() as usize,
+        2,
+        16,
+    );
     seed_low.material.e_psi = (base.material.e_psi * 0.97).clamp(1.0e6, 40.0e6);
     seed_low.boundary_conditions.fix_start_face = base.boundary_conditions.fix_end_face;
     seed_low.boundary_conditions.fix_end_face = base.boundary_conditions.fix_start_face;
@@ -2279,7 +2691,12 @@ fn build_seed_cases(base: &SolveInput) -> [SolveInput; PINO_RECIPE_SEED_COUNT] {
     seed_high.geometry.length_in = (base.geometry.length_in * 1.10).clamp(4.0, 30.0);
     seed_high.geometry.width_in = (base.geometry.width_in * 0.90).clamp(1.0, 12.0);
     seed_high.geometry.thickness_in = (base.geometry.thickness_in * 1.10).clamp(0.03, 0.75);
-    seed_high.mesh.nz = ((base.mesh.nz as f64) * 1.1).round().clamp(2.0, 16.0) as usize;
+    seed_high.mesh.nz = preserve_single_layer_nz(
+        base.mesh.nz,
+        ((base.mesh.nz as f64) * 1.1).round() as usize,
+        2,
+        16,
+    );
     seed_high.material.e_psi = (base.material.e_psi * 1.03).clamp(1.0e6, 40.0e6);
     seed_high.boundary_conditions.fix_start_face = true;
     seed_high.boundary_conditions.fix_end_face = true;
@@ -2318,12 +2735,17 @@ fn build_seed_cases(base: &SolveInput) -> [SolveInput; PINO_RECIPE_SEED_COUNT] {
     [seed_low, seed_mid, seed_high]
 }
 
-fn build_holdout_cases(base: &SolveInput) -> [SolveInput; 2] {
+pub(crate) fn build_holdout_cases(base: &SolveInput) -> [SolveInput; 2] {
     let mut a = base.clone();
     a.geometry.length_in = (base.geometry.length_in * 0.95).clamp(4.0, 30.0);
     a.geometry.width_in = (base.geometry.width_in * 1.03).clamp(1.0, 12.0);
     a.geometry.thickness_in = (base.geometry.thickness_in * 0.96).clamp(0.03, 0.75);
-    a.mesh.nz = ((base.mesh.nz as f64) * 0.95).round().clamp(2.0, 16.0) as usize;
+    a.mesh.nz = preserve_single_layer_nz(
+        base.mesh.nz,
+        ((base.mesh.nz as f64) * 0.95).round() as usize,
+        2,
+        16,
+    );
     a.load.axial_load_lbf = (base.load.axial_load_lbf * 0.95).clamp(-100_000.0, 100_000.0);
     a.load.vertical_point_load_lbf =
         (base.load.vertical_point_load_lbf * 0.95).clamp(-10_000.0, 10_000.0);
@@ -2334,7 +2756,12 @@ fn build_holdout_cases(base: &SolveInput) -> [SolveInput; 2] {
     b.geometry.length_in = (base.geometry.length_in * 1.05).clamp(4.0, 30.0);
     b.geometry.width_in = (base.geometry.width_in * 0.97).clamp(1.0, 12.0);
     b.geometry.thickness_in = (base.geometry.thickness_in * 1.04).clamp(0.03, 0.75);
-    b.mesh.nz = ((base.mesh.nz as f64) * 1.05).round().clamp(2.0, 16.0) as usize;
+    b.mesh.nz = preserve_single_layer_nz(
+        base.mesh.nz,
+        ((base.mesh.nz as f64) * 1.05).round() as usize,
+        2,
+        16,
+    );
     b.load.axial_load_lbf = (base.load.axial_load_lbf * 1.05).clamp(-100_000.0, 100_000.0);
     b.load.vertical_point_load_lbf =
         (base.load.vertical_point_load_lbf * 1.05).clamp(-10_000.0, 10_000.0);
@@ -2350,12 +2777,13 @@ mod tests {
         decode_prediction, encode_case,
         enforce_training_recipe, evaluate_holdout_projection, evaluate_holdout_projection_with_model,
         fit_operator_calibration, infer_config_for_case, model_config, operator_grid_spec,
+        axis_derivative_from_grid,
         normalized_axis, operator_residual_score, prediction_from_fem,
-        prediction_from_fem_with_grid_exact, solve_case_for_operator, train_operator_calibration,
-        OperatorCalibration, OperatorTrainableParams, PinoModelConfig, PINO_FIELD_HEAD_BASIS,
-        PINO_OUTPUT_CHANNELS,
+        prediction_from_fem_with_grid_exact, reconstruct_prediction_linear_elastic_from_displacement,
+        solve_case_for_operator, train_operator_calibration, OperatorCalibration, OperatorPrediction,
+        OperatorTrainableParams, PinoModelConfig, PINO_FIELD_HEAD_BASIS, PINO_OUTPUT_CHANNELS,
     };
-    use crate::contracts::SolveInput;
+    use crate::contracts::{OperatorGridSpec, SolveInput};
     use crate::contracts::TrainingBatch;
     use crate::fem::solve_case;
     use crate::pinn::UniversalPinnEngine;
@@ -2368,6 +2796,8 @@ mod tests {
             cases: vec![case],
             epochs: 12,
             target_loss: 0.01,
+            training_mode: None,
+            benchmark_id: None,
             seed: Some(5),
             analysis_type: Some(analysis_type.to_string()),
             pinn_backend: Some("pino-ndarray-cpu".to_string()),
@@ -2438,6 +2868,8 @@ mod tests {
             cases,
             epochs,
             target_loss,
+            training_mode: None,
+            benchmark_id: None,
             learning_rate: Some(5e-4),
             auto_mode: Some(true),
             max_total_epochs: Some(max_total_epochs),
@@ -3284,6 +3716,42 @@ mod tests {
     }
 
     #[test]
+    fn operator_grid_spec_preserves_single_layer_cases() {
+        let mut input = SolveInput::default();
+        input.mesh.nz = 1;
+        let spec = operator_grid_spec(&input);
+        assert_eq!(spec.nz, 1);
+    }
+
+    #[test]
+    fn exact_projection_uses_plane_stress_for_single_layer_cantilever_targets() {
+        let mut input = SolveInput::default();
+        input.geometry.length_in = 10.0;
+        input.geometry.width_in = 1.0;
+        input.geometry.thickness_in = 0.25;
+        input.geometry.hole_diameter_in = Some(0.0);
+        input.mesh.nx = 8;
+        input.mesh.ny = 6;
+        input.mesh.nz = 1;
+        input.load.vertical_point_load_lbf = -100.0;
+        let fem = solve_case(&input);
+        let target = prediction_from_fem_with_grid_exact(
+            &input,
+            &fem,
+            OperatorGridSpec {
+                nx: 12,
+                ny: 8,
+                nz: 1,
+                input_channels: 15,
+                output_channels: PINO_OUTPUT_CHANNELS,
+            },
+        );
+        assert!(target.szz.iter().all(|value| value.abs() <= 1e-9));
+        assert!(target.sxz.iter().all(|value| value.abs() <= 1e-9));
+        assert!(target.syz.iter().all(|value| value.abs() <= 1e-9));
+    }
+
+    #[test]
     fn fem_prediction_round_trip_decodes_to_result_view() {
         let input = SolveInput::default();
         let fem = solve_case(&input);
@@ -3303,6 +3771,8 @@ mod tests {
             cases: vec![input],
             epochs: 10,
             target_loss: 0.01,
+            training_mode: None,
+            benchmark_id: None,
             seed: Some(1),
             analysis_type: Some("cantilever".to_string()),
             pinn_backend: Some("pino-candle-cpu".to_string()),
@@ -3337,6 +3807,78 @@ mod tests {
         assert!(config.spectral_modes >= 2);
         assert_eq!(config.operator_grid.input_channels, 10);
         assert_eq!(config.operator_grid.output_channels, 7);
+    }
+
+    #[test]
+    fn benchmark_cantilever_uses_displacement_primary_output_channels() {
+        let input = SolveInput::default();
+        let batch = TrainingBatch {
+            cases: vec![input],
+            epochs: 16,
+            target_loss: 1e-4,
+            training_mode: Some("benchmark".to_string()),
+            benchmark_id: Some("benchmark_cantilever_2d".to_string()),
+            seed: Some(11),
+            analysis_type: Some("cantilever".to_string()),
+            pinn_backend: Some("pino-ndarray-cpu".to_string()),
+            collocation_points: None,
+            boundary_points: None,
+            interface_points: None,
+            residual_weight_momentum: None,
+            residual_weight_kinematics: None,
+            residual_weight_material: None,
+            residual_weight_boundary: None,
+            stage1_epochs: None,
+            stage2_epochs: None,
+            stage3_ramp_epochs: None,
+            contact_penalty: None,
+            plasticity_factor: None,
+            learning_rate: None,
+            auto_mode: None,
+            max_total_epochs: None,
+            min_improvement: None,
+            progress_emit_every_epochs: None,
+            network_emit_every_epochs: None,
+            online_active_learning: None,
+            autonomous_mode: None,
+            max_topology: None,
+            max_backoffs: None,
+            max_optimizer_switches: None,
+            checkpoint_every_epochs: None,
+            checkpoint_retention: None,
+        };
+        let config = model_config(&batch);
+        assert_eq!(
+            config.operator_grid.output_channels,
+            super::PINO_DISPLACEMENT_OUTPUT_CHANNELS
+        );
+        let meta = super::runtime_metadata(&batch, "pino-ndarray-cpu", config.spectral_modes);
+        assert_eq!(
+            meta.operator_grid.output_channels,
+            super::PINO_DISPLACEMENT_OUTPUT_CHANNELS
+        );
+        assert_eq!(meta.domain_dim, 2);
+        assert_eq!(
+            meta.physics_model,
+            "plane-stress-2d-displacement-primary-linear-elastic"
+        );
+    }
+
+    #[test]
+    fn displacement_primary_operator_prediction_reconstructs_stress_fields() {
+        let mut input = SolveInput::default();
+        input.mesh.nz = 1;
+        input.load.vertical_point_load_lbf = -100.0;
+        let mut config = infer_config_for_case(&input, "pino-ndarray-cpu", 4);
+        config.operator_grid.output_channels = super::PINO_DISPLACEMENT_OUTPUT_CHANNELS;
+        let prediction = build_operator_prediction(&input, &config);
+        assert_eq!(
+            prediction.grid.output_channels,
+            super::PINO_DISPLACEMENT_OUTPUT_CHANNELS
+        );
+        assert!(prediction.sxx.iter().all(|value| value.is_finite()));
+        assert!(prediction.von_mises.iter().all(|value| value.is_finite()));
+        assert!(prediction.max_principal.iter().all(|value| value.is_finite()));
     }
 
     #[test]
@@ -3540,6 +4082,8 @@ mod tests {
             cases: vec![SolveInput::default()],
             epochs: 6,
             target_loss: 0.1,
+            training_mode: None,
+            benchmark_id: None,
             seed: Some(7),
             analysis_type: Some("general".to_string()),
             pinn_backend: Some("pino-ndarray-cpu".to_string()),
@@ -3592,6 +4136,8 @@ mod tests {
             cases: vec![input.clone()],
             epochs: 4,
             target_loss: 0.1,
+            training_mode: None,
+            benchmark_id: None,
             seed: Some(17),
             analysis_type: Some("cantilever".to_string()),
             pinn_backend: Some("pino-ndarray-cpu".to_string()),
@@ -3632,12 +4178,70 @@ mod tests {
     }
 
     #[test]
+    fn displacement_reconstruction_uses_plane_stress_for_single_layer_grid() {
+        let mut input = SolveInput::default();
+        input.geometry.length_in = 10.0;
+        input.geometry.width_in = 1.0;
+        input.geometry.thickness_in = 0.25;
+        let prediction = OperatorPrediction {
+            grid: OperatorGridSpec {
+                nx: 2,
+                ny: 2,
+                nz: 1,
+                input_channels: 15,
+                output_channels: 11,
+            },
+            ux: vec![0.0, 0.01, 0.0, 0.01],
+            uy: vec![0.0, 0.0, 0.0, 0.0],
+            uz: vec![0.0, 0.0, 0.0, 0.0],
+            sxx: vec![0.0; 4],
+            syy: vec![0.0; 4],
+            szz: vec![0.0; 4],
+            sxy: vec![0.0; 4],
+            sxz: vec![0.0; 4],
+            syz: vec![0.0; 4],
+            von_mises: vec![0.0; 4],
+            max_principal: vec![0.0; 4],
+        };
+
+        let rebuilt = reconstruct_prediction_linear_elastic_from_displacement(&input, &prediction);
+        assert!(rebuilt.szz.iter().all(|value| value.abs() <= 1e-12));
+        assert!(rebuilt.sxz.iter().all(|value| value.abs() <= 1e-12));
+        assert!(rebuilt.syz.iter().all(|value| value.abs() <= 1e-12));
+    }
+
+    #[test]
+    fn axis_derivative_uses_second_order_boundary_stencil() {
+        let nx = 5usize;
+        let ny = 1usize;
+        let nz = 1usize;
+        let values = (0..nx)
+            .map(|i| {
+                let x = i as f64;
+                x * x
+            })
+            .collect::<Vec<_>>();
+        let left = axis_derivative_from_grid(&values, nx, ny, nz, 0, 0, 0, 0, 1.0);
+        let right = axis_derivative_from_grid(&values, nx, ny, nz, nx - 1, 0, 0, 0, 1.0);
+        assert!(
+            (left - 0.0).abs() <= 1e-9,
+            "quadratic derivative at left boundary should be exact, got {left}"
+        );
+        assert!(
+            (right - 8.0).abs() <= 1e-9,
+            "quadratic derivative at right boundary should be exact, got {right}"
+        );
+    }
+
+    #[test]
     fn operator_calibration_training_produces_loss_trace() {
         let input = SolveInput::default();
         let batch = TrainingBatch {
             cases: vec![input.clone()],
             epochs: 10,
             target_loss: 0.1,
+            training_mode: None,
+            benchmark_id: None,
             seed: Some(31),
             analysis_type: Some("cantilever".to_string()),
             pinn_backend: Some("pino-ndarray-cpu".to_string()),

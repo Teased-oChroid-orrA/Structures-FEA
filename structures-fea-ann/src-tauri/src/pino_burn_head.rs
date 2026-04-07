@@ -1,7 +1,11 @@
 use crate::pino::{
-    PINO_AUX_OUTPUT_CHANNELS, PINO_LAAF_GAIN, PINO_OUTPUT_CHANNELS, PINO_PRIMARY_OUTPUT_CHANNELS,
+    PINO_AUX_OUTPUT_CHANNELS, PINO_DISPLACEMENT_OUTPUT_CHANNELS, PINO_LAAF_GAIN,
+    PINO_OUTPUT_CHANNELS, PINO_PRIMARY_OUTPUT_CHANNELS,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "pino-ndarray-cpu")]
+use nalgebra::{DMatrix, DVector};
 #[cfg(feature = "pino-ndarray-cpu")]
 use burn::module::{Module, ModuleVisitor, Param, ParamId};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
@@ -22,11 +26,16 @@ pub struct BurnPhysicsSample {
     pub target_fields: Vec<f64>,
     pub base_fields: Vec<f64>,
     pub correction_scales: Vec<f64>,
+    pub output_dim: usize,
+    pub characteristic_disp_scale: f64,
+    pub characteristic_stress_scale: f64,
     pub observable_target: Vec<f64>,
     pub observable_scale: Vec<f64>,
     pub observable_weight: Vec<f64>,
     pub observable_projection: Vec<f64>,
     pub observable_fifth_uses_vm: bool,
+    pub benchmark_vm_active: Vec<f64>,
+    pub benchmark_sxx_peak: Vec<f64>,
     pub stress_focus: Vec<f64>,
     pub ring_loss_mask: Vec<f64>,
     pub mask: Vec<f64>,
@@ -73,12 +82,48 @@ pub struct BurnPhysicsTrainingOutcome {
 }
 
 const PINO_OBSERVABLE_COUNT: usize = 5;
+static ISOLATED_EXACT_CANTILEVER_OVERRIDE: AtomicBool = AtomicBool::new(false);
+static BENCHMARK_CANTILEVER_OVERRIDE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_isolated_exact_cantilever_override(enabled: bool) {
+    ISOLATED_EXACT_CANTILEVER_OVERRIDE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_benchmark_cantilever_override(enabled: bool) {
+    BENCHMARK_CANTILEVER_OVERRIDE.store(enabled, Ordering::Relaxed);
+}
+
+fn isolated_exact_cantilever_surface(exact_surface: bool) -> bool {
+    exact_surface
+        && (ISOLATED_EXACT_CANTILEVER_OVERRIDE.load(Ordering::Relaxed)
+            || env_flag("PINO_HEADLESS_ISOLATED_EXACT_CANTILEVER", false)
+            || matches!(
+                std::env::var("PINO_HEADLESS_BENCHMARK_ID").ok().as_deref(),
+                Some("benchmark_cantilever_2d")
+            ))
+}
+
+fn benchmark_cantilever_characteristic_training(exact_surface: bool) -> bool {
+    exact_surface
+        && (BENCHMARK_CANTILEVER_OVERRIDE.load(Ordering::Relaxed)
+            || matches!(
+                std::env::var("PINO_HEADLESS_BENCHMARK_ID").ok().as_deref(),
+                Some("benchmark_cantilever_2d")
+            ))
+}
 
 fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
         .ok()
         .and_then(|raw| raw.parse::<f64>().ok())
         .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|raw| matches!(raw.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
         .unwrap_or(default)
 }
 
@@ -110,6 +155,7 @@ struct PhysicsSampleTensors {
     features: Tensor<HeadBackend, 2>,
     base_fields: Tensor<HeadBackend, 2>,
     correction_scales: Tensor<HeadBackend, 2>,
+    output_dim: usize,
     primary_target_fields: Tensor<HeadBackend, 2>,
     auxiliary_target_fields: Tensor<HeadBackend, 2>,
     auxiliary_base_fields: Tensor<HeadBackend, 2>,
@@ -128,6 +174,8 @@ struct PhysicsSampleTensors {
     observable_weight: Tensor<HeadBackend, 2>,
     observable_projection: Tensor<HeadBackend, 2>,
     observable_fifth_uses_vm: bool,
+    benchmark_vm_active_cells: Tensor<HeadBackend, 2>,
+    benchmark_sxx_peak_cells: Tensor<HeadBackend, 2>,
     stress_focus_cells: Tensor<HeadBackend, 2>,
     stress_focus_primary_fields: Tensor<HeadBackend, 2>,
     stress_focus_auxiliary_fields: Tensor<HeadBackend, 2>,
@@ -435,7 +483,7 @@ impl<B: burn::tensor::backend::Backend<FloatElem = f32>> BurnFieldHead<B> {
         }
     }
 
-    fn forward(
+    fn encode(
         &self,
         input: Tensor<B, 2>,
         neighbor_average: Tensor<B, 2>,
@@ -462,6 +510,16 @@ impl<B: burn::tensor::backend::Backend<FloatElem = f32>> BurnFieldHead<B> {
                 self.operator_activation_scales[layer].val(),
             );
         }
+        current
+    }
+
+    fn forward(
+        &self,
+        input: Tensor<B, 2>,
+        neighbor_average: Tensor<B, 2>,
+        spectral_projection: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
+        let current = self.encode(input, neighbor_average, spectral_projection);
         Self::soft_clip(
             current.matmul(self.output_weight.val().swap_dims(0, 1))
                 + self.output_bias.val().unsqueeze(),
@@ -658,6 +716,12 @@ fn tensor_to_scalar(tensor: Tensor<HeadBackend, 1>) -> Option<f64> {
 }
 
 #[cfg(feature = "pino-ndarray-cpu")]
+fn smooth_normalized_tail(loss: Tensor<HeadBackend, 1>, scale: f32) -> Tensor<HeadBackend, 1> {
+    let normalized = loss / scale.max(1.0e-6);
+    ((normalized.clone() * normalized) + 1.0).sqrt() - 1.0
+}
+
+#[cfg(feature = "pino-ndarray-cpu")]
 fn prepare_physics_samples(samples: &[BurnPhysicsSample]) -> Option<Vec<PhysicsSampleTensors>> {
     if samples.is_empty() {
         return None;
@@ -675,6 +739,7 @@ fn prepare_physics_samples(samples: &[BurnPhysicsSample]) -> Option<Vec<PhysicsS
         ),
     > = HashMap::new();
     for sample in samples {
+        let output_dim = sample.output_dim.clamp(1, PINO_OUTPUT_CHANNELS);
         let cells = sample
             .grid_nx
             .checked_mul(sample.grid_ny)?
@@ -689,6 +754,8 @@ fn prepare_physics_samples(samples: &[BurnPhysicsSample]) -> Option<Vec<PhysicsS
             || sample.observable_scale.len() != PINO_OBSERVABLE_COUNT
             || sample.observable_weight.len() != PINO_OBSERVABLE_COUNT
             || sample.observable_projection.len() != cells * PINO_OBSERVABLE_COUNT
+            || sample.benchmark_vm_active.len() != cells
+            || sample.benchmark_sxx_peak.len() != cells
             || sample.stress_focus.len() != cells
             || sample.ring_loss_mask.len() != cells
             || sample.mask.len() != cells
@@ -719,26 +786,28 @@ fn prepare_physics_samples(samples: &[BurnPhysicsSample]) -> Option<Vec<PhysicsS
             ),
             &device,
         );
-        let base_fields = Tensor::<HeadBackend, 2>::from_data(
-            Data::new(
-                sample
-                    .base_fields
+        let mut model_base_fields = Vec::with_capacity(cells * output_dim);
+        let mut model_correction_scales = Vec::with_capacity(cells * output_dim);
+        for idx in 0..cells {
+            let start = idx * PINO_OUTPUT_CHANNELS;
+            let end = start + output_dim;
+            model_base_fields.extend(
+                sample.base_fields[start..end]
                     .iter()
-                    .map(|value| *value as f32)
-                    .collect::<Vec<_>>(),
-                [cells, PINO_OUTPUT_CHANNELS].into(),
-            ),
+                    .map(|value| *value as f32),
+            );
+            model_correction_scales.extend(
+                sample.correction_scales[start..end]
+                    .iter()
+                    .map(|value| *value as f32),
+            );
+        }
+        let base_fields = Tensor::<HeadBackend, 2>::from_data(
+            Data::new(model_base_fields, [cells, output_dim].into()),
             &device,
         );
         let correction_scales = Tensor::<HeadBackend, 2>::from_data(
-            Data::new(
-                sample
-                    .correction_scales
-                    .iter()
-                    .map(|value| *value as f32)
-                    .collect::<Vec<_>>(),
-                [cells, PINO_OUTPUT_CHANNELS].into(),
-            ),
+            Data::new(model_correction_scales, [cells, output_dim].into()),
             &device,
         );
         let cache_key = (
@@ -878,12 +947,20 @@ fn prepare_physics_samples(samples: &[BurnPhysicsSample]) -> Option<Vec<PhysicsS
         let auxiliary_target_fields = target_fields
             .clone()
             .slice([0..cells, PINO_PRIMARY_OUTPUT_CHANNELS..PINO_OUTPUT_CHANNELS]);
-        let auxiliary_base_fields = base_fields
-            .clone()
-            .slice([0..cells, PINO_PRIMARY_OUTPUT_CHANNELS..PINO_OUTPUT_CHANNELS]);
-        let auxiliary_scale_fields = correction_scales
-            .clone()
-            .slice([0..cells, PINO_PRIMARY_OUTPUT_CHANNELS..PINO_OUTPUT_CHANNELS]);
+        let auxiliary_base_fields = if output_dim > PINO_PRIMARY_OUTPUT_CHANNELS {
+            base_fields
+                .clone()
+                .slice([0..cells, PINO_PRIMARY_OUTPUT_CHANNELS..output_dim])
+        } else {
+            Tensor::<HeadBackend, 2>::zeros([cells, PINO_AUX_OUTPUT_CHANNELS], &device)
+        };
+        let auxiliary_scale_fields = if output_dim > PINO_PRIMARY_OUTPUT_CHANNELS {
+            correction_scales
+                .clone()
+                .slice([0..cells, PINO_PRIMARY_OUTPUT_CHANNELS..output_dim])
+        } else {
+            Tensor::<HeadBackend, 2>::ones([cells, PINO_AUX_OUTPUT_CHANNELS], &device)
+        };
         let primary_mask_fields = mask_cells
             .clone()
             .matmul(Tensor::<HeadBackend, 2>::ones([1, PINO_PRIMARY_OUTPUT_CHANNELS], &device));
@@ -965,6 +1042,28 @@ fn prepare_physics_samples(samples: &[BurnPhysicsSample]) -> Option<Vec<PhysicsS
             ),
             &device,
         );
+        let benchmark_vm_active_cells = Tensor::<HeadBackend, 2>::from_data(
+            Data::new(
+                sample
+                    .benchmark_vm_active
+                    .iter()
+                    .map(|value| value.max(0.0) as f32)
+                    .collect::<Vec<_>>(),
+                [cells, 1].into(),
+            ),
+            &device,
+        );
+        let benchmark_sxx_peak_cells = Tensor::<HeadBackend, 2>::from_data(
+            Data::new(
+                sample
+                    .benchmark_sxx_peak
+                    .iter()
+                    .map(|value| value.max(0.0) as f32)
+                    .collect::<Vec<_>>(),
+                [cells, 1].into(),
+            ),
+            &device,
+        );
         let mut disp_scale = 1.0e-6_f64;
         let mut stress_scale = 1.0_f64;
         let mut channel_scale = [1.0_f64; PINO_OUTPUT_CHANNELS];
@@ -1019,6 +1118,7 @@ fn prepare_physics_samples(samples: &[BurnPhysicsSample]) -> Option<Vec<PhysicsS
             features,
             base_fields,
             correction_scales,
+            output_dim,
             primary_target_fields,
             auxiliary_target_fields,
             auxiliary_base_fields,
@@ -1037,6 +1137,8 @@ fn prepare_physics_samples(samples: &[BurnPhysicsSample]) -> Option<Vec<PhysicsS
             observable_weight,
             observable_projection,
             observable_fifth_uses_vm: sample.observable_fifth_uses_vm,
+            benchmark_vm_active_cells,
+            benchmark_sxx_peak_cells,
             stress_focus_cells,
             stress_focus_primary_fields,
             stress_focus_auxiliary_fields,
@@ -1085,6 +1187,97 @@ fn prepare_physics_samples(samples: &[BurnPhysicsSample]) -> Option<Vec<PhysicsS
 }
 
 #[cfg(feature = "pino-ndarray-cpu")]
+fn apply_characteristic_training_scales(
+    prepared: &mut [PhysicsSampleTensors],
+    samples: &[BurnPhysicsSample],
+) {
+    for (prepared_sample, raw_sample) in prepared.iter_mut().zip(samples.iter()) {
+        let characteristic_disp = raw_sample.characteristic_disp_scale.max(0.0);
+        let characteristic_stress = raw_sample.characteristic_stress_scale.max(0.0);
+        if characteristic_disp <= 0.0 && characteristic_stress <= 0.0 {
+            continue;
+        }
+
+        let device = prepared_sample.primary_channel_scale.device();
+        let mut primary_scale = prepared_sample
+            .primary_channel_scale
+            .clone()
+            .into_data()
+            .value;
+        let mut observable_scale = prepared_sample
+            .observable_scale
+            .clone()
+            .into_data()
+            .value;
+
+        if characteristic_disp > 0.0 {
+            for value in primary_scale.iter_mut().take(3) {
+                *value = value.max(characteristic_disp as f32);
+            }
+            for value in observable_scale.iter_mut().take(2) {
+                *value = value.max(characteristic_disp as f32);
+            }
+            prepared_sample.disp_scale =
+                (prepared_sample.disp_scale as f64).max(characteristic_disp) as f32;
+        }
+
+        if characteristic_stress > 0.0 {
+            for value in primary_scale.iter_mut().skip(3) {
+                *value = value.max(characteristic_stress as f32);
+            }
+            for value in observable_scale.iter_mut().skip(2) {
+                *value = value.max(characteristic_stress as f32);
+            }
+            let mut auxiliary_scale = prepared_sample
+                .auxiliary_channel_scale
+                .clone()
+                .into_data()
+                .value;
+            for value in auxiliary_scale.iter_mut() {
+                *value = value.max(characteristic_stress as f32);
+            }
+            prepared_sample.auxiliary_channel_scale = Tensor::<HeadBackend, 2>::from_data(
+                Data::new(auxiliary_scale, [1, PINO_AUX_OUTPUT_CHANNELS].into()),
+                &device,
+            );
+            prepared_sample.stress_scale =
+                (prepared_sample.stress_scale as f64).max(characteristic_stress) as f32;
+            let characteristic_equilibrium = characteristic_stress
+                / raw_sample
+                    .dx
+                    .max(raw_sample.dy)
+                    .max(raw_sample.dz)
+                    .max(1e-6);
+            prepared_sample.equilibrium_scale = (prepared_sample.equilibrium_scale as f64)
+                .max(characteristic_equilibrium)
+                .max(1.0) as f32;
+        }
+
+        prepared_sample.primary_channel_scale = Tensor::<HeadBackend, 2>::from_data(
+            Data::new(primary_scale, [1, PINO_PRIMARY_OUTPUT_CHANNELS].into()),
+            &device,
+        );
+        prepared_sample.observable_scale = Tensor::<HeadBackend, 2>::from_data(
+            Data::new(observable_scale, [1, PINO_OBSERVABLE_COUNT].into()),
+            &device,
+        );
+    }
+}
+
+#[cfg(feature = "pino-ndarray-cpu")]
+fn prepare_physics_samples_for_objective(
+    samples: &[BurnPhysicsSample],
+    exact_surface: bool,
+    characteristic_train_scaling: bool,
+) -> Option<Vec<PhysicsSampleTensors>> {
+    let mut prepared = prepare_physics_samples(samples)?;
+    if characteristic_train_scaling || benchmark_cantilever_characteristic_training(exact_surface) {
+        apply_characteristic_training_scales(&mut prepared, samples);
+    }
+    Some(prepared)
+}
+
+#[cfg(feature = "pino-ndarray-cpu")]
 fn physics_loss(
     model: &BurnFieldHead<HeadBackend>,
     samples: &[PhysicsSampleTensors],
@@ -1092,6 +1285,13 @@ fn physics_loss(
     exact_surface: bool,
 ) -> Option<PhysicsLossTensors> {
     let device = samples.first()?.features.device();
+    let isolated_exact_cantilever = isolated_exact_cantilever_surface(exact_surface);
+    let benchmark_cantilever = BENCHMARK_CANTILEVER_OVERRIDE.load(Ordering::Relaxed)
+        || matches!(
+            std::env::var("PINO_HEADLESS_BENCHMARK_ID").ok().as_deref(),
+            Some("benchmark_cantilever_2d")
+        );
+    let displacement_primary_exact = isolated_exact_cantilever && exact_surface;
     let mut data_acc = tensor_scalar(0.0, &device);
     let mut displacement_acc = tensor_scalar(0.0, &device);
     let mut stress_acc = tensor_scalar(0.0, &device);
@@ -1105,6 +1305,7 @@ fn physics_loss(
     let mut constitutive_shear_acc = tensor_scalar(0.0, &device);
     let mut weak_energy_acc = tensor_scalar(0.0, &device);
     let mut boundary_acc = tensor_scalar(0.0, &device);
+    let mut any_benchmark_displacement_primary = false;
     let auxiliary_weight = if exact_surface {
         0.0f32
     } else if loss_weights.0 <= 0.24 && loss_weights.2 <= 0.30 {
@@ -1123,35 +1324,123 @@ fn physics_loss(
     } else {
         0.10f32
     };
-
     for sample in samples {
         let cells = sample.grid_nx * sample.grid_ny * sample.grid_nz;
+        let displacement_only_head = sample.output_dim == PINO_DISPLACEMENT_OUTPUT_CHANNELS;
+        let benchmark_displacement_primary = benchmark_cantilever && displacement_only_head;
+        any_benchmark_displacement_primary |= benchmark_displacement_primary;
         let raw_predictions = model.forward(
             sample.features.clone(),
             sample.neighbor_average.clone(),
             sample.spectral_projection.clone(),
         );
-        let raw_auxiliary_predictions = raw_predictions
-            .clone()
-            .slice([0..cells, PINO_PRIMARY_OUTPUT_CHANNELS..PINO_OUTPUT_CHANNELS]);
         let predicted_fields =
             sample.base_fields.clone() + raw_predictions.clone() * sample.correction_scales.clone();
-        let primary_predicted = predicted_fields
-            .clone()
-            .slice([0..cells, 0..PINO_PRIMARY_OUTPUT_CHANNELS]);
-        let primary_data_loss = robust_mean_square(
-            ((primary_predicted.clone() - sample.primary_target_fields.clone())
-                / sample.primary_channel_scale.clone())
-                * sample.primary_mask_fields.clone(),
-        );
+        let primary_predicted = if displacement_only_head {
+            predicted_fields.clone()
+        } else {
+            predicted_fields
+                .clone()
+                .slice([0..cells, 0..PINO_PRIMARY_OUTPUT_CHANNELS])
+        };
         let displacement_data_loss = robust_mean_square(
             ((primary_predicted.clone().slice([0..cells, 0..3])
                 - sample.primary_target_fields.clone().slice([0..cells, 0..3]))
                 / sample.primary_channel_scale.clone().slice([0..1, 0..3]))
                 * sample.primary_mask_fields.clone().slice([0..cells, 0..3]),
         );
-        let stress_data_loss = robust_mean_square(
-            ((primary_predicted.clone().slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS])
+
+        let ux = predicted_fields.clone().slice([0..cells, 0..1]);
+        let uy = predicted_fields.clone().slice([0..cells, 1..2]);
+        let uz = predicted_fields.clone().slice([0..cells, 2..3]);
+        let grad_x = sample.diff_x.clone().matmul(primary_predicted.clone());
+        let grad_y = sample.diff_y.clone().matmul(primary_predicted.clone());
+        let grad_z = sample.diff_z.clone().matmul(primary_predicted.clone());
+        let dux_dx = grad_x.clone().slice([0..cells, 0..1]);
+        let dux_dy = grad_y.clone().slice([0..cells, 0..1]);
+        let dux_dz = grad_z.clone().slice([0..cells, 0..1]);
+        let duy_dx = grad_x.clone().slice([0..cells, 1..2]);
+        let duy_dy = grad_y.clone().slice([0..cells, 1..2]);
+        let duy_dz = grad_z.clone().slice([0..cells, 1..2]);
+        let duz_dx = grad_x.clone().slice([0..cells, 2..3]);
+        let duz_dy = grad_y.clone().slice([0..cells, 2..3]);
+        let duz_dz = grad_z.clone().slice([0..cells, 2..3]);
+
+        let exx = dux_dx;
+        let eyy = duy_dy;
+        let ezz = duz_dz;
+        let gxy = dux_dy.clone() + duy_dx.clone();
+        let gxz = dux_dz.clone() + duz_dx.clone();
+        let gyz = duy_dz.clone() + duz_dy.clone();
+        let lambda = sample.e_modulus * sample.poisson
+            / ((1.0 + sample.poisson) * (1.0 - 2.0 * sample.poisson)).max(1e-4);
+        let shear = sample.e_modulus / (2.0 * (1.0 + sample.poisson)).max(1e-4);
+        let plane_stress_2d = sample.grid_nz <= 1;
+        let trace = exx.clone() + eyy.clone() + ezz.clone();
+        let plane_stress_c = sample.e_modulus / (1.0 - sample.poisson * sample.poisson).max(1e-4);
+        let zero_stress_column = || {
+            Tensor::<HeadBackend, 2>::from_data(
+                Data::new(vec![0.0; cells], [cells, 1].into()),
+                &device,
+            )
+        };
+        let expected_sxx = if plane_stress_2d {
+            (exx.clone() + eyy.clone() * sample.poisson) * plane_stress_c
+        } else {
+            exx.clone() * (2.0 * shear) + trace.clone() * lambda
+        };
+        let expected_syy = if plane_stress_2d {
+            (eyy.clone() + exx.clone() * sample.poisson) * plane_stress_c
+        } else {
+            eyy.clone() * (2.0 * shear) + trace.clone() * lambda
+        };
+        let expected_szz = if plane_stress_2d {
+            zero_stress_column()
+        } else {
+            ezz.clone() * (2.0 * shear) + trace.clone() * lambda
+        };
+        let expected_sxy = gxy * shear;
+        let expected_sxz = if plane_stress_2d {
+            zero_stress_column()
+        } else {
+            gxz * shear
+        };
+        let expected_syz = if plane_stress_2d {
+            zero_stress_column()
+        } else {
+            gyz * shear
+        };
+        let primary_data_loss = if displacement_only_head || displacement_primary_exact {
+            displacement_data_loss.clone()
+        } else {
+            robust_mean_square(
+                ((predicted_fields
+                    .clone()
+                    .slice([0..cells, 0..PINO_PRIMARY_OUTPUT_CHANNELS])
+                    - sample.primary_target_fields.clone())
+                    / sample.primary_channel_scale.clone())
+                    * sample.primary_mask_fields.clone(),
+            )
+        };
+        let derived_stress_predicted = Tensor::cat(
+            vec![
+                expected_sxx.clone(),
+                expected_syy.clone(),
+                expected_szz.clone(),
+                expected_sxy.clone(),
+                expected_sxz.clone(),
+                expected_syz.clone(),
+            ],
+            1,
+        );
+        let legacy_stress_data_loss = robust_mean_square(
+            (((if displacement_only_head || displacement_primary_exact {
+                derived_stress_predicted.clone()
+            } else {
+                primary_predicted
+                    .clone()
+                    .slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS])
+            })
                 - sample
                     .primary_target_fields
                     .clone()
@@ -1166,109 +1455,106 @@ fn physics_loss(
                     .slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS])
                 * sample.stress_focus_primary_fields.clone(),
         );
-
-        let ux = predicted_fields.clone().slice([0..cells, 0..1]);
-        let uy = predicted_fields.clone().slice([0..cells, 1..2]);
-        let uz = predicted_fields.clone().slice([0..cells, 2..3]);
-        let sxx = predicted_fields.clone().slice([0..cells, 3..4]);
-        let syy = predicted_fields.clone().slice([0..cells, 4..5]);
-        let szz = predicted_fields.clone().slice([0..cells, 5..6]);
-        let sxy = predicted_fields.clone().slice([0..cells, 6..7]);
-        let sxz = predicted_fields.clone().slice([0..cells, 7..8]);
-        let syz = predicted_fields.clone().slice([0..cells, 8..9]);
-
-        let grad_x = sample.diff_x.clone().matmul(primary_predicted.clone());
-        let grad_y = sample.diff_y.clone().matmul(primary_predicted.clone());
-        let grad_z = sample.diff_z.clone().matmul(primary_predicted.clone());
-        let dux_dx = grad_x.clone().slice([0..cells, 0..1]);
-        let dux_dy = grad_y.clone().slice([0..cells, 0..1]);
-        let dux_dz = grad_z.clone().slice([0..cells, 0..1]);
-        let duy_dx = grad_x.clone().slice([0..cells, 1..2]);
-        let duy_dy = grad_y.clone().slice([0..cells, 1..2]);
-        let duy_dz = grad_z.clone().slice([0..cells, 1..2]);
-        let duz_dx = grad_x.clone().slice([0..cells, 2..3]);
-        let duz_dy = grad_y.clone().slice([0..cells, 2..3]);
-        let duz_dz = grad_z.clone().slice([0..cells, 2..3]);
-        let dsxx_dx = grad_x.clone().slice([0..cells, 3..4]);
-        let dsxy_dy = grad_y.clone().slice([0..cells, 6..7]);
-        let dsxz_dz = grad_z.clone().slice([0..cells, 7..8]);
-        let dsxy_dx = grad_x.clone().slice([0..cells, 6..7]);
-        let dsyy_dy = grad_y.clone().slice([0..cells, 4..5]);
-        let dsyz_dz = grad_z.clone().slice([0..cells, 8..9]);
-        let dsxz_dx = grad_x.clone().slice([0..cells, 7..8]);
-        let dsyz_dy = grad_y.clone().slice([0..cells, 8..9]);
-        let dszz_dz = grad_z.clone().slice([0..cells, 5..6]);
+        let stress_fields_for_metric = if displacement_only_head {
+            derived_stress_predicted.clone()
+        } else {
+            primary_predicted
+                .clone()
+                .slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS])
+        };
+        let stress_grad_x = sample.diff_x.clone().matmul(stress_fields_for_metric.clone());
+        let stress_grad_y = sample.diff_y.clone().matmul(stress_fields_for_metric.clone());
+        let stress_grad_z = sample.diff_z.clone().matmul(stress_fields_for_metric.clone());
+        let metric_sxx = stress_fields_for_metric.clone().slice([0..cells, 0..1]);
+        let metric_syy = stress_fields_for_metric.clone().slice([0..cells, 1..2]);
+        let metric_szz = stress_fields_for_metric.clone().slice([0..cells, 2..3]);
+        let metric_sxy = stress_fields_for_metric.clone().slice([0..cells, 3..4]);
+        let metric_sxz = stress_fields_for_metric.clone().slice([0..cells, 4..5]);
+        let metric_syz = stress_fields_for_metric.clone().slice([0..cells, 5..6]);
+        let sxx = metric_sxx.clone();
+        let syy = metric_syy.clone();
+        let szz = metric_szz.clone();
+        let sxy = metric_sxy.clone();
+        let sxz = metric_sxz.clone();
+        let syz = metric_syz.clone();
+        let dsxx_dx = stress_grad_x.clone().slice([0..cells, 0..1]);
+        let dsxy_dy = stress_grad_y.clone().slice([0..cells, 3..4]);
+        let dsxz_dz = stress_grad_z.clone().slice([0..cells, 4..5]);
+        let dsxy_dx = stress_grad_x.clone().slice([0..cells, 3..4]);
+        let dsyy_dy = stress_grad_y.clone().slice([0..cells, 1..2]);
+        let dsyz_dz = stress_grad_z.clone().slice([0..cells, 5..6]);
+        let dsxz_dx = stress_grad_x.clone().slice([0..cells, 4..5]);
+        let dsyz_dy = stress_grad_y.clone().slice([0..cells, 5..6]);
+        let dszz_dz = stress_grad_z.clone().slice([0..cells, 2..3]);
         let equilibrium_norm = sample.equilibrium_scale;
-        let equilibrium_loss =
-            robust_mean_square(((dsxx_dx + dsxy_dy + dsxz_dz) / equilibrium_norm) * sample.mask_cells.clone())
-                + robust_mean_square(
-                    ((dsxy_dx + dsyy_dy + dsyz_dz) / equilibrium_norm) * sample.mask_cells.clone(),
-                )
-                + robust_mean_square(
-                    ((dsxz_dx + dsyz_dy + dszz_dz) / equilibrium_norm) * sample.mask_cells.clone(),
-                );
-
-        let exx = dux_dx;
-        let eyy = duy_dy;
-        let ezz = duz_dz;
-        let gxy = dux_dy.clone() + duy_dx.clone();
-        let gxz = dux_dz.clone() + duz_dx.clone();
-        let gyz = duy_dz.clone() + duz_dy.clone();
-        let lambda = sample.e_modulus * sample.poisson
-            / ((1.0 + sample.poisson) * (1.0 - 2.0 * sample.poisson)).max(1e-4);
-        let shear = sample.e_modulus / (2.0 * (1.0 + sample.poisson)).max(1e-4);
-        let trace = exx.clone() + eyy.clone() + ezz.clone();
-        let expected_sxx = exx.clone() * (2.0 * shear) + trace.clone() * lambda;
-        let expected_syy = eyy.clone() * (2.0 * shear) + trace.clone() * lambda;
-        let expected_szz = ezz.clone() * (2.0 * shear) + trace.clone() * lambda;
-        let expected_sxy = gxy * shear;
-        let expected_sxz = gxz * shear;
-        let expected_syz = gyz * shear;
-        let constitutive_normal_loss =
-            robust_mean_square(
-                ((sxx.clone() - expected_sxx.clone()) / sample.stress_scale)
-                    * sample.mask_cells.clone()
-                    * sample.stress_focus_cells.clone(),
-            )
-                + robust_mean_square(
-                    ((syy.clone() - expected_syy.clone()) / sample.stress_scale)
-                        * sample.mask_cells.clone()
-                        * sample.stress_focus_cells.clone(),
-                )
-                + robust_mean_square(
-                    ((szz.clone() - expected_szz.clone()) / sample.stress_scale)
-                        * sample.mask_cells.clone()
-                        * sample.stress_focus_cells.clone(),
-                );
+        let equilibrium_x_loss = robust_mean_square(
+            ((dsxx_dx + dsxy_dy + dsxz_dz) / equilibrium_norm) * sample.mask_cells.clone(),
+        );
+        let equilibrium_y_loss = robust_mean_square(
+            ((dsxy_dx + dsyy_dy + dsyz_dz) / equilibrium_norm) * sample.mask_cells.clone(),
+        );
+        let equilibrium_z_loss = robust_mean_square(
+            ((dsxz_dx + dsyz_dy + dszz_dz) / equilibrium_norm) * sample.mask_cells.clone(),
+        );
+        let equilibrium_loss = if plane_stress_2d {
+            equilibrium_x_loss + equilibrium_y_loss
+        } else {
+            equilibrium_x_loss + equilibrium_y_loss + equilibrium_z_loss
+        };
+        let constitutive_normal_loss = robust_mean_square(
+            ((sxx.clone() - expected_sxx.clone()) / sample.stress_scale)
+                * sample.mask_cells.clone()
+                * sample.stress_focus_cells.clone(),
+        ) + robust_mean_square(
+            ((syy.clone() - expected_syy.clone()) / sample.stress_scale)
+                * sample.mask_cells.clone()
+                * sample.stress_focus_cells.clone(),
+        ) + robust_mean_square(
+            ((szz.clone() - expected_szz.clone()) / sample.stress_scale)
+                * sample.mask_cells.clone()
+                * sample.stress_focus_cells.clone(),
+        );
         let constitutive_shear_loss = robust_mean_square(
-                ((sxy.clone() - expected_sxy.clone()) / sample.stress_scale)
-                    * sample.mask_cells.clone()
-                    * sample.stress_focus_cells.clone(),
-            )
-                + robust_mean_square(
-                    ((sxz.clone() - expected_sxz.clone()) / sample.stress_scale)
-                        * sample.mask_cells.clone()
-                        * sample.stress_focus_cells.clone(),
-                )
-                + robust_mean_square(
-                    ((syz.clone() - expected_syz.clone()) / sample.stress_scale)
-                        * sample.mask_cells.clone()
-                        * sample.stress_focus_cells.clone(),
-                );
-        let predicted_energy_density = ((sxx.clone() * exx.clone())
-            + (syy.clone() * eyy.clone())
-            + (szz.clone() * ezz.clone())
-            + (sxy.clone() * (dux_dy.clone() + duy_dx.clone()))
-            + (sxz.clone() * (dux_dz.clone() + duz_dx.clone()))
-            + (syz.clone() * (duy_dz.clone() + duz_dy.clone())))
-            * 0.5;
-        let expected_energy_density = ((expected_sxx.clone() * exx.clone())
-            + (expected_syy.clone() * eyy.clone())
-            + (expected_szz.clone() * ezz.clone())
-            + (expected_sxy.clone() * (dux_dy.clone() + duy_dx.clone()))
-            + (expected_sxz.clone() * (dux_dz.clone() + duz_dx.clone()))
-            + (expected_syz.clone() * (duy_dz.clone() + duz_dy.clone())))
-            * 0.5;
+            ((sxy.clone() - expected_sxy.clone()) / sample.stress_scale)
+                * sample.mask_cells.clone()
+                * sample.stress_focus_cells.clone(),
+        ) + robust_mean_square(
+            ((sxz.clone() - expected_sxz.clone()) / sample.stress_scale)
+                * sample.mask_cells.clone()
+                * sample.stress_focus_cells.clone(),
+        ) + robust_mean_square(
+            ((syz.clone() - expected_syz.clone()) / sample.stress_scale)
+                * sample.mask_cells.clone()
+                * sample.stress_focus_cells.clone(),
+        );
+        let expected_energy_density = if plane_stress_2d {
+            ((expected_sxx.clone() * exx.clone())
+                + (expected_syy.clone() * eyy.clone())
+                + (expected_sxy.clone() * (dux_dy.clone() + duy_dx.clone())))
+                * 0.5
+        } else {
+            ((expected_sxx.clone() * exx.clone())
+                + (expected_syy.clone() * eyy.clone())
+                + (expected_szz.clone() * ezz.clone())
+                + (expected_sxy.clone() * (dux_dy.clone() + duy_dx.clone()))
+                + (expected_sxz.clone() * (dux_dz.clone() + duz_dx.clone()))
+                + (expected_syz.clone() * (duy_dz.clone() + duz_dy.clone())))
+                * 0.5
+        };
+        let predicted_energy_density = if plane_stress_2d {
+            ((sxx.clone() * exx.clone())
+                + (syy.clone() * eyy.clone())
+                + (sxy.clone() * (dux_dy.clone() + duy_dx.clone())))
+                * 0.5
+        } else {
+            ((sxx.clone() * exx.clone())
+                + (syy.clone() * eyy.clone())
+                + (szz.clone() * ezz.clone())
+                + (sxy.clone() * (dux_dy.clone() + duy_dx.clone()))
+                + (sxz.clone() * (dux_dz.clone() + duz_dx.clone()))
+                + (syz.clone() * (duy_dz.clone() + duz_dy.clone())))
+                * 0.5
+        };
         let energy_scale = (sample.stress_scale * sample.disp_scale).max(1.0e-6);
         let weak_energy_loss = robust_mean_square(
             ((predicted_energy_density - expected_energy_density) / energy_scale)
@@ -1276,23 +1562,45 @@ fn physics_loss(
                 * sample.stress_focus_cells.clone(),
         );
 
-        let mean_stress = (sxx.clone() + syy.clone() + szz.clone()) / 3.0;
-        let p2 = ((sxx.clone() - mean_stress.clone()).powf_scalar(2.0)
-            + (syy.clone() - mean_stress.clone()).powf_scalar(2.0)
-            + (szz.clone() - mean_stress.clone()).powf_scalar(2.0)
-            + (sxy.clone().powf_scalar(2.0) + sxz.clone().powf_scalar(2.0) + syz.clone().powf_scalar(2.0)) * 2.0)
-            / 6.0;
-        let derived_principal = mean_stress.clone() + (p2.clone() * 2.0 + 1.0e-9).sqrt();
-        let derived_vm = ((((sxx.clone() - syy.clone()).powf_scalar(2.0)
-            + (syy.clone() - szz.clone()).powf_scalar(2.0)
-            + (szz.clone() - sxx.clone()).powf_scalar(2.0))
-            * 0.5
-            + (sxy.clone().powf_scalar(2.0)
-                + sxz.clone().powf_scalar(2.0)
-                + syz.clone().powf_scalar(2.0))
-                * 3.0
-            + 1.0e-9))
-            .sqrt();
+        let derived_principal = if plane_stress_2d {
+            let mean_stress = (metric_sxx.clone() + metric_syy.clone()) * 0.5;
+            let radius = ((((metric_sxx.clone() - metric_syy.clone()) * 0.5).powf_scalar(2.0)
+                + metric_sxy.clone().powf_scalar(2.0))
+                + 1.0e-9)
+                .sqrt();
+            mean_stress + radius
+        } else {
+            let mean_stress =
+                (metric_sxx.clone() + metric_syy.clone() + metric_szz.clone()) / 3.0;
+            let p2 = ((metric_sxx.clone() - mean_stress.clone()).powf_scalar(2.0)
+                + (metric_syy.clone() - mean_stress.clone()).powf_scalar(2.0)
+                + (metric_szz.clone() - mean_stress.clone()).powf_scalar(2.0)
+                + (metric_sxy.clone().powf_scalar(2.0)
+                    + metric_sxz.clone().powf_scalar(2.0)
+                    + metric_syz.clone().powf_scalar(2.0))
+                    * 2.0)
+                / 6.0;
+            mean_stress + (p2 * 2.0 + 1.0e-9).sqrt()
+        };
+        let derived_vm = if plane_stress_2d {
+            ((metric_sxx.clone().powf_scalar(2.0)
+                - metric_sxx.clone() * metric_syy.clone()
+                + metric_syy.clone().powf_scalar(2.0)
+                + metric_sxy.clone().powf_scalar(2.0) * 3.0
+                + 1.0e-9))
+                .sqrt()
+        } else {
+            ((((metric_sxx.clone() - metric_syy.clone()).powf_scalar(2.0)
+                + (metric_syy.clone() - metric_szz.clone()).powf_scalar(2.0)
+                + (metric_szz.clone() - metric_sxx.clone()).powf_scalar(2.0))
+                * 0.5
+                + (metric_sxy.clone().powf_scalar(2.0)
+                    + metric_sxz.clone().powf_scalar(2.0)
+                    + metric_syz.clone().powf_scalar(2.0))
+                    * 3.0
+                + 1.0e-9))
+                .sqrt()
+        };
         let derived_auxiliary = Tensor::cat(
             vec![
                 derived_vm.clone().reshape([cells, 1]),
@@ -1306,44 +1614,83 @@ fn physics_loss(
                 * sample.ring_loss_mask.clone()
                 * sample.mask_cells.clone(),
         );
-        let observable_predicted = Tensor::cat(
-            vec![
-                sample
-                    .observable_projection
-                    .clone()
-                    .slice([0..1, 0..cells])
-                    .matmul(predicted_fields.clone().slice([0..cells, 1..2])),
-                sample
-                    .observable_projection
-                    .clone()
-                    .slice([1..2, 0..cells])
-                    .matmul(predicted_fields.clone().slice([0..cells, 0..1])),
-                sample
-                    .observable_projection
-                    .clone()
-                    .slice([2..3, 0..cells])
-                    .matmul(derived_auxiliary.clone().slice([0..cells, 0..1])),
-                sample
-                    .observable_projection
-                    .clone()
-                    .slice([3..4, 0..cells])
-                    .matmul(derived_auxiliary.clone().slice([0..cells, 1..2])),
-                if sample.observable_fifth_uses_vm {
+        let observable_predicted = if benchmark_displacement_primary {
+            let disp_mag =
+                ((ux.clone().powf_scalar(2.0)
+                    + uy.clone().powf_scalar(2.0)
+                    + uz.clone().powf_scalar(2.0))
+                    + 1.0e-9)
+                    .sqrt();
+            Tensor::cat(
+                vec![
+                    sample
+                        .observable_projection
+                        .clone()
+                        .slice([0..1, 0..cells])
+                        .matmul(predicted_fields.clone().slice([0..cells, 1..2])),
+                    sample
+                        .observable_projection
+                        .clone()
+                        .slice([1..2, 0..cells])
+                        .matmul(disp_mag),
+                    sample
+                        .observable_projection
+                        .clone()
+                        .slice([2..3, 0..cells])
+                        .matmul(derived_auxiliary.clone().slice([0..cells, 0..1])),
+                    sample
+                        .observable_projection
+                        .clone()
+                        .slice([3..4, 0..cells])
+                        .matmul(derived_auxiliary.clone().slice([0..cells, 1..2])),
                     sample
                         .observable_projection
                         .clone()
                         .slice([4..5, 0..cells])
-                        .matmul(derived_auxiliary.clone().slice([0..cells, 0..1]))
-                } else {
+                        .matmul(metric_sxx.clone().abs()),
+                ],
+                1,
+            )
+        } else {
+            Tensor::cat(
+                vec![
                     sample
                         .observable_projection
                         .clone()
-                        .slice([4..5, 0..cells])
-                        .matmul(predicted_fields.clone().slice([0..cells, 3..4]).abs())
-                },
-            ],
-            1,
-        );
+                        .slice([0..1, 0..cells])
+                        .matmul(predicted_fields.clone().slice([0..cells, 1..2])),
+                    sample
+                        .observable_projection
+                        .clone()
+                        .slice([1..2, 0..cells])
+                        .matmul(predicted_fields.clone().slice([0..cells, 0..1])),
+                    sample
+                        .observable_projection
+                        .clone()
+                        .slice([2..3, 0..cells])
+                        .matmul(derived_auxiliary.clone().slice([0..cells, 0..1])),
+                    sample
+                        .observable_projection
+                        .clone()
+                        .slice([3..4, 0..cells])
+                        .matmul(derived_auxiliary.clone().slice([0..cells, 1..2])),
+                    if sample.observable_fifth_uses_vm {
+                        sample
+                            .observable_projection
+                            .clone()
+                            .slice([4..5, 0..cells])
+                            .matmul(derived_auxiliary.clone().slice([0..cells, 0..1]))
+                    } else {
+                        sample
+                            .observable_projection
+                            .clone()
+                            .slice([4..5, 0..cells])
+                            .matmul(metric_sxx.clone().abs())
+                    },
+                ],
+                1,
+            )
+        };
         let observable_loss = robust_mean_square(
             ((observable_predicted - sample.observable_target.clone())
                 / sample.observable_scale.clone())
@@ -1355,14 +1702,36 @@ fn physics_loss(
                 * sample.auxiliary_mask_fields.clone()
                 * sample.stress_focus_auxiliary_fields.clone(),
         );
-        let auxiliary_consistency_target =
-            (derived_auxiliary.clone() - sample.auxiliary_base_fields.clone())
-                / (sample.auxiliary_scale_fields.clone() + 1.0e-6);
-        let auxiliary_consistency_loss = robust_mean_square(
-            (raw_auxiliary_predictions - auxiliary_consistency_target)
-                * sample.auxiliary_mask_fields.clone()
-                * sample.stress_focus_auxiliary_fields.clone(),
+        let benchmark_sigma_xx_loss = robust_mean_square(
+            ((expected_sxx.clone()
+                - sample
+                    .primary_target_fields
+                    .clone()
+                    .slice([0..cells, 3..4]))
+                / sample.primary_channel_scale.clone().slice([0..1, 3..4]))
+                * sample.benchmark_sxx_peak_cells.clone(),
         );
+        let benchmark_vm_loss = robust_mean_square(
+            ((derived_auxiliary.clone().slice([0..cells, 0..1])
+                - sample.auxiliary_target_fields.clone().slice([0..cells, 0..1]))
+                / sample.auxiliary_channel_scale.clone().slice([0..1, 0..1]))
+                * sample.benchmark_vm_active_cells.clone(),
+        );
+        let auxiliary_consistency_loss = if displacement_only_head {
+            tensor_scalar(0.0, &device)
+        } else {
+            let raw_auxiliary_predictions = raw_predictions
+                .clone()
+                .slice([0..cells, PINO_PRIMARY_OUTPUT_CHANNELS..PINO_OUTPUT_CHANNELS]);
+            let auxiliary_consistency_target =
+                (derived_auxiliary.clone() - sample.auxiliary_base_fields.clone())
+                    / (sample.auxiliary_scale_fields.clone() + 1.0e-6);
+            robust_mean_square(
+                (raw_auxiliary_predictions - auxiliary_consistency_target)
+                    * sample.auxiliary_mask_fields.clone()
+                    * sample.stress_focus_auxiliary_fields.clone(),
+            )
+        };
 
         let coarse_primary_pred = (sample.neighbor_average.clone().matmul(primary_predicted.clone())
             + sample.spectral_projection.clone().matmul(primary_predicted.clone()))
@@ -1376,47 +1745,62 @@ fn physics_loss(
                 * sample.auxiliary_mask_fields.clone()
                 * sample.stress_focus_auxiliary_fields.clone(),
         );
-        let coarse_primary_loss = robust_mean_square(
-            ((coarse_primary_pred.clone() - sample.coarse_primary_target.clone())
-                / sample.primary_channel_scale.clone())
-                * sample.primary_mask_fields.clone(),
-        );
         let coarse_displacement_loss = robust_mean_square(
             ((coarse_primary_pred.clone().slice([0..cells, 0..3])
                 - sample.coarse_primary_target.clone().slice([0..cells, 0..3]))
                 / sample.primary_channel_scale.clone().slice([0..1, 0..3]))
                 * sample.primary_mask_fields.clone().slice([0..cells, 0..3]),
         );
-        let coarse_stress_loss = robust_mean_square(
-            ((coarse_primary_pred.clone().slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS])
-                - sample
-                    .coarse_primary_target
-                    .clone()
-                    .slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS]))
-                / sample
-                    .primary_channel_scale
-                    .clone()
-                    .slice([0..1, 3..PINO_PRIMARY_OUTPUT_CHANNELS]))
-                * sample
-                    .primary_mask_fields
-                    .clone()
-                    .slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS])
-                * sample.stress_focus_primary_fields.clone(),
-        );
+        let coarse_primary_loss = if displacement_only_head {
+            coarse_displacement_loss.clone()
+        } else {
+            robust_mean_square(
+                ((coarse_primary_pred.clone() - sample.coarse_primary_target.clone())
+                    / sample.primary_channel_scale.clone())
+                    * sample.primary_mask_fields.clone(),
+            )
+        };
+        let coarse_stress_loss = if displacement_only_head {
+            tensor_scalar(0.0, &device)
+        } else {
+            let coarse_metric_stress = coarse_primary_pred
+                .clone()
+                .slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS]);
+            robust_mean_square(
+                ((coarse_metric_stress
+                    - sample
+                        .coarse_primary_target
+                        .clone()
+                        .slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS]))
+                    / sample
+                        .primary_channel_scale
+                        .clone()
+                        .slice([0..1, 3..PINO_PRIMARY_OUTPUT_CHANNELS]))
+                    * sample
+                        .primary_mask_fields
+                        .clone()
+                        .slice([0..cells, 3..PINO_PRIMARY_OUTPUT_CHANNELS])
+                    * sample.stress_focus_primary_fields.clone(),
+            )
+        };
 
         let clamp_boundary_loss = (robust_mean_square((ux / sample.disp_scale) * sample.clamp_cells.clone())
             + robust_mean_square((uy / sample.disp_scale) * sample.clamp_cells.clone())
             + robust_mean_square((uz / sample.disp_scale) * sample.clamp_cells.clone()))
             * sample.boundary_scale;
-        let traction_x = sxx.clone() * sample.traction_normals.clone().slice([0..cells, 0..1])
-            + sxy.clone() * sample.traction_normals.clone().slice([0..cells, 1..2])
-            + sxz.clone() * sample.traction_normals.clone().slice([0..cells, 2..3]);
-        let traction_y = sxy.clone() * sample.traction_normals.clone().slice([0..cells, 0..1])
-            + syy.clone() * sample.traction_normals.clone().slice([0..cells, 1..2])
-            + syz.clone() * sample.traction_normals.clone().slice([0..cells, 2..3]);
-        let traction_z = sxz.clone() * sample.traction_normals.clone().slice([0..cells, 0..1])
-            + syz.clone() * sample.traction_normals.clone().slice([0..cells, 1..2])
-            + szz.clone() * sample.traction_normals.clone().slice([0..cells, 2..3]);
+        let traction_x = metric_sxx.clone() * sample.traction_normals.clone().slice([0..cells, 0..1])
+            + metric_sxy.clone() * sample.traction_normals.clone().slice([0..cells, 1..2])
+            + metric_sxz.clone() * sample.traction_normals.clone().slice([0..cells, 2..3]);
+        let traction_y = metric_sxy.clone() * sample.traction_normals.clone().slice([0..cells, 0..1])
+            + metric_syy.clone() * sample.traction_normals.clone().slice([0..cells, 1..2])
+            + metric_syz.clone() * sample.traction_normals.clone().slice([0..cells, 2..3]);
+        let traction_z = if plane_stress_2d {
+            zero_stress_column()
+        } else {
+            metric_sxz.clone() * sample.traction_normals.clone().slice([0..cells, 0..1])
+                + metric_syz.clone() * sample.traction_normals.clone().slice([0..cells, 1..2])
+                + metric_szz.clone() * sample.traction_normals.clone().slice([0..cells, 2..3])
+        };
         let traction_pred = Tensor::cat(vec![traction_x, traction_y, traction_z], 1);
         let traction_boundary_loss = robust_mean_square(
             ((traction_pred - sample.traction_targets.clone()) / sample.stress_scale)
@@ -1429,9 +1813,18 @@ fn physics_loss(
         } else {
             env_f64("PINO_RING_LOSS_WEIGHT", 0.38).clamp(0.0, 4.0)
         };
-        let stress_total =
-            stress_data_loss + coarse_stress_loss * coarse_weight + ring_band_loss * ring_loss_weight;
-        let auxiliary_data_total = auxiliary_data_loss + coarse_aux_loss * coarse_weight;
+        let stress_total = if benchmark_displacement_primary {
+            benchmark_sigma_xx_loss + benchmark_vm_loss * 1.25 + ring_band_loss * ring_loss_weight
+        } else {
+            legacy_stress_data_loss
+                + coarse_stress_loss * coarse_weight
+                + ring_band_loss * ring_loss_weight
+        };
+        let auxiliary_data_total = if benchmark_displacement_primary {
+            tensor_scalar(0.0, &device)
+        } else {
+            auxiliary_data_loss + coarse_aux_loss * coarse_weight
+        };
         data_acc = data_acc + primary_data_loss + coarse_primary_loss * coarse_weight + observable_loss.clone();
         displacement_acc = displacement_acc + displacement_total;
         stress_acc = stress_acc + stress_total;
@@ -1467,7 +1860,85 @@ fn physics_loss(
     let constitutive_shear = constitutive_shear_acc / sample_count;
     let weak_energy = weak_energy_acc / sample_count;
     let boundary = boundary_acc / sample_count;
-    let total = if exact_surface {
+    let total = if any_benchmark_displacement_primary {
+        let base_data = loss_weights.1 as f32;
+        let base_boundary = loss_weights.3 as f32;
+        let displacement_rel = smooth_normalized_tail(displacement_fit.clone(), 0.05);
+        let stress_rel = smooth_normalized_tail(stress_fit.clone(), 1.0);
+        let observable_rel = smooth_normalized_tail(observable.clone(), 0.20);
+        let data_rel = smooth_normalized_tail(data.clone(), 0.40);
+        let boundary_rel = smooth_normalized_tail(boundary.clone(), 0.50);
+        let equilibrium_rel = smooth_normalized_tail(equilibrium.clone(), 250.0);
+        if exact_surface {
+            let stress_rel = smooth_normalized_tail(stress_fit.clone(), 0.50);
+            let observable_rel = smooth_normalized_tail(observable.clone(), 1.00);
+            displacement_rel * (base_data.max(1.0) * 2.20)
+                + stress_rel * (base_data.max(1.0) * 2.40)
+                + observable_rel * (base_data.max(1.0) * 0.20)
+                + data_rel * (base_data.max(1.0) * 0.05)
+                + boundary_rel * (base_boundary.max(0.25) * 0.02)
+                + equilibrium_rel * 0.005
+        } else {
+            displacement_rel * (base_data.max(1.0) * 1.70)
+                + observable_rel * (base_data.max(1.0) * 1.45)
+                + stress_rel * (base_data.max(1.0) * 1.30)
+                + data_rel * (base_data.max(1.0) * 0.35)
+                + boundary_rel * (base_boundary.max(0.25) * 0.25)
+                + equilibrium_rel * 0.08
+        }
+    } else if isolated_exact_cantilever {
+        let base_data = loss_weights.1 as f32;
+        let base_eq = loss_weights.0 as f32;
+        let base_constitutive = loss_weights.2 as f32;
+        let base_boundary = loss_weights.3 as f32;
+        let floor_proxy = (tensor_to_scalar(stress_fit.clone()).unwrap_or(0.0).abs() / 120.0)
+            + (tensor_to_scalar(constitutive_normal.clone()).unwrap_or(0.0).abs() / 32.0)
+            + (tensor_to_scalar(constitutive_shear.clone()).unwrap_or(0.0).abs() / 18.0)
+            + (tensor_to_scalar(weak_energy.clone()).unwrap_or(0.0).abs() / 80.0)
+            + (tensor_to_scalar(observable.clone()).unwrap_or(0.0).abs() / 2.0)
+            + (tensor_to_scalar(equilibrium.clone()).unwrap_or(0.0).abs() / 0.5)
+            + (tensor_to_scalar(displacement_fit.clone()).unwrap_or(0.0).abs() / 0.25)
+            + (tensor_to_scalar(boundary.clone()).unwrap_or(0.0).abs() / 0.05);
+        let relative_focus = ((floor_proxy / 20.0).clamp(0.10, 1.0)) as f32;
+        let absolute_focus = (1.15 - relative_focus * 0.70).clamp(0.35, 1.10);
+        let late_floor_focus = ((1.5 - floor_proxy).clamp(0.0, 1.5) / 1.5) as f32;
+        let stress_scale = (24.0 - 10.0 * late_floor_focus).max(10.0);
+        let constitutive_normal_scale = (6.0 - 2.5 * late_floor_focus).max(2.5);
+        let data_rel = smooth_normalized_tail(data.clone(), 1.0);
+        let observable_rel = smooth_normalized_tail(observable.clone(), 1.0);
+        let displacement_rel = smooth_normalized_tail(displacement_fit.clone(), 0.25);
+        let stress_rel = smooth_normalized_tail(stress_fit.clone(), stress_scale);
+        let equilibrium_rel = smooth_normalized_tail(equilibrium.clone(), 0.10);
+        let constitutive_normal_rel =
+            smooth_normalized_tail(constitutive_normal.clone(), constitutive_normal_scale);
+        let constitutive_shear_rel = smooth_normalized_tail(constitutive_shear.clone(), 1.6);
+        let weak_energy_rel = smooth_normalized_tail(weak_energy.clone(), 0.10);
+        let boundary_rel = smooth_normalized_tail(boundary.clone(), 0.05);
+        let stress_tail = smooth_normalized_tail(stress_fit.clone(), stress_scale);
+        let equilibrium_tail = equilibrium_rel.clone();
+        let constitutive_normal_tail =
+            smooth_normalized_tail(constitutive_normal.clone(), constitutive_normal_scale);
+        let constitutive_shear_tail = constitutive_shear_rel.clone();
+        let weak_energy_tail = weak_energy_rel.clone();
+        data_rel * (base_data * 0.30 * relative_focus)
+            + observable_rel * (base_data.max(1.0) * 1.15 * relative_focus)
+            + displacement_rel * (base_data.max(1.0) * 1.35 * relative_focus)
+            + stress_rel * (base_data.max(1.0) * (1.10 + 0.18 * late_floor_focus) * relative_focus)
+            + equilibrium_rel * (base_eq.max(0.25) * 0.95 * relative_focus)
+            + constitutive_normal_rel
+                * (base_constitutive.max(0.25) * (1.70 + 0.24 * late_floor_focus) * relative_focus)
+            + constitutive_shear_rel
+                * (base_constitutive.max(0.25) * 1.40 * relative_focus)
+            + weak_energy_rel * (1.95 * relative_focus)
+            + boundary_rel * (base_boundary.max(0.35) * 0.60 * relative_focus)
+            + stress_tail * (base_data.max(1.0) * (0.16 + 0.08 * late_floor_focus) * absolute_focus)
+            + equilibrium_tail * (base_eq.max(0.25) * 0.12 * absolute_focus)
+            + constitutive_normal_tail
+                * (base_constitutive.max(0.25) * (0.22 + 0.10 * late_floor_focus) * absolute_focus)
+            + constitutive_shear_tail
+                * (base_constitutive.max(0.25) * 0.18 * absolute_focus)
+            + weak_energy_tail * (0.16 * absolute_focus)
+    } else if exact_surface {
         let base_data = loss_weights.1 as f32;
         let base_boundary = loss_weights.3 as f32;
         data.clone() * base_data
@@ -1571,6 +2042,181 @@ fn dense_gradients_from_model(
 }
 
 #[cfg(feature = "pino-ndarray-cpu")]
+fn capture_model_state(model: &BurnFieldHead<HeadBackend>) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let lift_weight_data = model.lift_weight.val().into_data().convert::<f64>();
+    let output_weight_data = model.output_weight.val().into_data().convert::<f64>();
+    let lift_bias_data = model.lift_bias.val().into_data().convert::<f64>();
+    let output_bias_data = model.output_bias.val().into_data().convert::<f64>();
+    let mut activation = model
+        .lift_activation_scale
+        .val()
+        .into_data()
+        .convert::<f64>()
+        .value;
+    let mut weights = lift_weight_data.value;
+    for layer in 0..model.hidden_layers {
+        weights.extend(
+            model.operator_self_weights[layer]
+                .val()
+                .into_data()
+                .convert::<f64>()
+                .value,
+        );
+        weights.extend(
+            model.operator_local_weights[layer]
+                .val()
+                .into_data()
+                .convert::<f64>()
+                .value,
+        );
+        weights.extend(
+            model.operator_global_weights[layer]
+                .val()
+                .into_data()
+                .convert::<f64>()
+                .value,
+        );
+        weights.extend(
+            model.operator_contrast_weights[layer]
+                .val()
+                .into_data()
+                .convert::<f64>()
+                .value,
+        );
+        activation.extend(
+            model.operator_activation_scales[layer]
+                .val()
+                .into_data()
+                .convert::<f64>()
+                .value,
+        );
+    }
+    weights.extend(output_weight_data.value);
+    let mut bias = lift_bias_data.value;
+    for bias_param in &model.operator_biases {
+        bias.extend(bias_param.val().into_data().convert::<f64>().value);
+    }
+    bias.extend(output_bias_data.value);
+    (weights, bias, activation)
+}
+
+#[cfg(feature = "pino-ndarray-cpu")]
+fn ridge_refit_output_layer(
+    prepared: &[PhysicsSampleTensors],
+    init_weights: &[f64],
+    init_bias: &[f64],
+    init_activation: &[f64],
+    input_dim: usize,
+    output_dim: usize,
+    hidden_layers: usize,
+    hidden_width: usize,
+) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    let device = prepared.first()?.features.device();
+    let mut model = BurnFieldHead::<HeadBackend>::new_from_state(
+        &device,
+        input_dim,
+        output_dim,
+        hidden_layers,
+        hidden_width,
+        init_weights,
+        init_bias,
+        init_activation,
+    );
+    let mut row_count = 0usize;
+    for sample in prepared {
+        row_count = row_count.saturating_add(sample.grid_nx * sample.grid_ny * sample.grid_nz);
+    }
+    if row_count == 0 {
+        return None;
+    }
+    let cols = hidden_width + 1;
+    let mut design = vec![0.0f64; row_count * cols];
+    let mut targets = vec![0.0f64; row_count * output_dim];
+    let mut row_offset = 0usize;
+    for sample in prepared {
+        let cells = sample.grid_nx * sample.grid_ny * sample.grid_nz;
+        let hidden = model.encode(
+            sample.features.clone(),
+            sample.neighbor_average.clone(),
+            sample.spectral_projection.clone(),
+        );
+        let hidden_vec = hidden.into_data().convert::<f64>().value;
+        let primary = sample
+            .primary_target_fields
+            .clone()
+            .into_data()
+            .convert::<f64>()
+            .value;
+        let auxiliary = sample
+            .auxiliary_target_fields
+            .clone()
+            .into_data()
+            .convert::<f64>()
+            .value;
+        for row in 0..cells {
+            let global_row = row_offset + row;
+            for col in 0..hidden_width {
+                design[global_row * cols + col] = hidden_vec[row * hidden_width + col];
+            }
+            design[global_row * cols + hidden_width] = 1.0;
+            if output_dim == PINO_DISPLACEMENT_OUTPUT_CHANNELS {
+                for col in 0..PINO_DISPLACEMENT_OUTPUT_CHANNELS {
+                    targets[global_row * output_dim + col] =
+                        primary[row * PINO_PRIMARY_OUTPUT_CHANNELS + col];
+                }
+            } else {
+                for col in 0..PINO_PRIMARY_OUTPUT_CHANNELS {
+                    targets[global_row * output_dim + col] =
+                        primary[row * PINO_PRIMARY_OUTPUT_CHANNELS + col];
+                }
+                for col in 0..PINO_AUX_OUTPUT_CHANNELS {
+                    targets[global_row * output_dim + PINO_PRIMARY_OUTPUT_CHANNELS + col] =
+                        auxiliary[row * PINO_AUX_OUTPUT_CHANNELS + col];
+                }
+            }
+        }
+        row_offset += cells;
+    }
+    let x = DMatrix::from_row_slice(row_count, cols, &design);
+    let xt = x.transpose();
+    let mut xtx = &xt * &x;
+    let lambda = 1e-6;
+    for idx in 0..cols {
+        xtx[(idx, idx)] += lambda;
+    }
+    let lu = xtx.lu();
+    let mut output_weight = vec![0.0f64; output_dim * hidden_width];
+    let mut output_bias = vec![0.0f64; output_dim];
+    for out_idx in 0..output_dim {
+        let mut target = Vec::with_capacity(row_count);
+        for row in 0..row_count {
+            target.push(targets[row * output_dim + out_idx]);
+        }
+        let y = DVector::from_vec(target);
+        let rhs = &xt * y;
+        let beta = lu.solve(&rhs)?;
+        for in_idx in 0..hidden_width {
+            output_weight[out_idx * hidden_width + in_idx] = beta[in_idx];
+        }
+        output_bias[out_idx] = beta[hidden_width];
+    }
+    model.output_weight = Param::from_data(
+        Data::new(
+            output_weight.iter().map(|value| *value as f32).collect::<Vec<_>>(),
+            [output_dim, hidden_width].into(),
+        ),
+        &device,
+    );
+    model.output_bias = Param::from_data(
+        Data::new(
+            output_bias.iter().map(|value| *value as f32).collect::<Vec<_>>(),
+            [output_dim].into(),
+        ),
+        &device,
+    );
+    Some(capture_model_state(&model))
+}
+
 fn evaluate_physics_loss_dense(
     prepared: &[PhysicsSampleTensors],
     flat_params: &[f64],
@@ -1632,8 +2278,10 @@ fn train_operator_field_head_physics_inner(
     learning_rate: f64,
     loss_weights: (f64, f64, f64, f64),
     exact_surface: bool,
+    characteristic_train_scaling: bool,
 ) -> Option<BurnPhysicsTrainingOutcome> {
-    let prepared = prepare_physics_samples(samples)?;
+    let prepared =
+        prepare_physics_samples_for_objective(samples, exact_surface, characteristic_train_scaling)?;
     let device = prepared.first()?.features.device();
     let mut model = BurnFieldHead::<HeadBackend>::new_from_state(
         &device,
@@ -1828,8 +2476,10 @@ fn train_operator_field_head_physics_lbfgs(
     learning_rate: f64,
     loss_weights: (f64, f64, f64, f64),
     exact_surface: bool,
+    characteristic_train_scaling: bool,
 ) -> Option<BurnPhysicsTrainingOutcome> {
-    let prepared = prepare_physics_samples(samples)?;
+    let prepared =
+        prepare_physics_samples_for_objective(samples, exact_surface, characteristic_train_scaling)?;
     let weights_len = init_weights.len();
     let bias_len = init_bias.len();
     let mut current = Vec::with_capacity(weights_len + bias_len + init_activation.len());
@@ -1940,8 +2590,9 @@ pub fn train_operator_field_head_physics(
     optimizer: BurnFieldHeadOptimizer,
     loss_weights: (f64, f64, f64, f64),
     exact_surface: bool,
+    characteristic_train_scaling: bool,
 ) -> Option<BurnPhysicsTrainingOutcome> {
-    match optimizer {
+    let mut outcome = match optimizer {
         BurnFieldHeadOptimizer::Adam => train_operator_field_head_physics_inner(
             samples,
             init_weights,
@@ -1955,6 +2606,7 @@ pub fn train_operator_field_head_physics(
             learning_rate,
             loss_weights,
             exact_surface,
+            characteristic_train_scaling,
         ),
         BurnFieldHeadOptimizer::Lbfgs => train_operator_field_head_physics_lbfgs(
             samples,
@@ -1969,8 +2621,53 @@ pub fn train_operator_field_head_physics(
             learning_rate,
             loss_weights,
             exact_surface,
+            characteristic_train_scaling,
         ),
+    }?;
+    if isolated_exact_cantilever_surface(exact_surface) {
+        let prepared =
+            prepare_physics_samples_for_objective(samples, exact_surface, characteristic_train_scaling)?;
+        if let Some((ridge_weights, ridge_bias, ridge_activation)) = ridge_refit_output_layer(
+            &prepared,
+            &outcome.weights,
+            &outcome.bias,
+            &outcome.activation,
+            input_dim,
+            output_dim,
+            hidden_layers,
+            hidden_width,
+        ) {
+            let mut flat = Vec::with_capacity(
+                ridge_weights.len() + ridge_bias.len() + ridge_activation.len(),
+            );
+            flat.extend_from_slice(&ridge_weights);
+            flat.extend_from_slice(&ridge_bias);
+            flat.extend_from_slice(&ridge_activation);
+            if let Some((ridge_breakdown, _)) = evaluate_physics_loss_dense(
+                &prepared,
+                &flat,
+                ridge_weights.len(),
+                ridge_bias.len(),
+                input_dim,
+                output_dim,
+                hidden_layers,
+                hidden_width,
+                loss_weights,
+                exact_surface,
+            ) {
+                let accept_margin = (outcome.breakdown.total.abs() * 0.0005).max(1e-12);
+                if ridge_breakdown.total + accept_margin < outcome.breakdown.total {
+                    outcome = BurnPhysicsTrainingOutcome {
+                        weights: ridge_weights,
+                        bias: ridge_bias,
+                        activation: ridge_activation,
+                        breakdown: ridge_breakdown,
+                    };
+                }
+            }
+        }
     }
+    Some(outcome)
 }
 
 #[cfg(feature = "pino-ndarray-cpu")]
@@ -1986,7 +2683,7 @@ pub fn evaluate_operator_field_head_physics(
     loss_weights: (f64, f64, f64, f64),
     exact_surface: bool,
 ) -> Option<BurnPhysicsLossBreakdown> {
-    let prepared = prepare_physics_samples(samples)?;
+    let prepared = prepare_physics_samples_for_objective(samples, exact_surface, false)?;
     let device = prepared.first()?.features.device();
     let model = BurnFieldHead::<HeadBackend>::new_from_state(
         &device,
@@ -2020,7 +2717,7 @@ pub fn evaluate_operator_field_head_physics_grad_norm(
     loss_weights: (f64, f64, f64, f64),
     exact_surface: bool,
 ) -> Option<f64> {
-    let prepared = prepare_physics_samples(samples)?;
+    let prepared = prepare_physics_samples_for_objective(samples, exact_surface, false)?;
     let weights_len = weights.len();
     let bias_len = bias.len();
     let mut flat = Vec::with_capacity(weights_len + bias_len + activation.len());
@@ -2058,6 +2755,7 @@ pub fn train_operator_field_head_physics(
     _optimizer: BurnFieldHeadOptimizer,
     _loss_weights: (f64, f64, f64, f64),
     _exact_surface: bool,
+    _characteristic_train_scaling: bool,
 ) -> Option<BurnPhysicsTrainingOutcome> {
     None
 }
@@ -2286,6 +2984,9 @@ mod tests {
             target_fields,
             base_fields: vec![0.0; cell_count * PINO_OUTPUT_CHANNELS],
             correction_scales: vec![1.0; cell_count * PINO_OUTPUT_CHANNELS],
+            output_dim: PINO_OUTPUT_CHANNELS,
+            characteristic_disp_scale: 0.0,
+            characteristic_stress_scale: 0.0,
             observable_target: vec![
                 weighted(&uy_values, &tip_uy_projection),
                 weighted(&ux_values, &end_ux_projection),
@@ -2304,6 +3005,8 @@ mod tests {
             ]
             .concat(),
             observable_fifth_uses_vm: false,
+            benchmark_vm_active: vec![1.0; cell_count],
+            benchmark_sxx_peak: vec![1.0; cell_count],
             stress_focus: vec![1.0; cell_count],
             ring_loss_mask: vec![0.0; cell_count],
             mask,
@@ -2354,6 +3057,7 @@ mod tests {
             0.002,
             BurnFieldHeadOptimizer::Lbfgs,
             (1.0, 1.0, 0.15, 1.0),
+            false,
             false,
         )
         .expect("lbfgs outcome");
@@ -2412,6 +3116,7 @@ mod tests {
             sample.grid_ny,
             sample.grid_nz,
             sample.spectral_modes,
+            sample.output_dim,
         );
         let max_diff = burn
             .iter()

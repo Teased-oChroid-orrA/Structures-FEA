@@ -249,6 +249,10 @@ pub struct TrainingBatch {
     pub epochs: usize,
     pub target_loss: f64,
     #[serde(default)]
+    pub training_mode: Option<String>,
+    #[serde(default)]
+    pub benchmark_id: Option<String>,
+    #[serde(default)]
     pub seed: Option<u64>,
     #[serde(default)]
     pub analysis_type: Option<String>,
@@ -606,6 +610,24 @@ impl TrainingBatch {
             }
         }
 
+        if let Some(training_mode) = &self.training_mode {
+            match training_mode.as_str() {
+                "legacy-mixed-exact" | "benchmark" | "production-generalized" => {}
+                other => {
+                    return Err(format!(
+                        "Unsupported training mode '{other}'. Expected legacy-mixed-exact, benchmark, or production-generalized."
+                    ))
+                }
+            }
+        }
+
+        if matches!(self.benchmark_id.as_deref(), Some("")) {
+            return Err("benchmarkId must be non-empty when provided.".to_string());
+        }
+        if matches!(self.training_mode.as_deref(), Some("benchmark")) && self.benchmark_id.is_none() {
+            return Err("benchmarkId is required when trainingMode is benchmark.".to_string());
+        }
+
         for (name, value) in [
             ("learningRate", self.learning_rate),
             ("minImprovement", self.min_improvement),
@@ -785,9 +807,37 @@ pub struct TrainingProgressEvent {
     pub learning_rate: f64,
     pub architecture: Vec<usize>,
     pub progress_ratio: f64,
+    #[serde(default)]
+    pub training_mode: String,
+    #[serde(default)]
+    pub benchmark_id: Option<String>,
+    #[serde(default)]
+    pub gate_status: String,
+    #[serde(default)]
+    pub certified_best_metric: f64,
+    #[serde(default)]
+    pub dominant_blocker: Option<String>,
+    #[serde(default)]
+    pub stalled_reason: Option<String>,
     pub network: NetworkSnapshot,
     #[serde(default)]
     pub pino: Option<PinoRuntimeMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkCertification {
+    pub status: String,
+    pub summary: String,
+    pub suggested_target_loss: f64,
+    #[serde(default)]
+    pub tip_displacement_relative_error: Option<f64>,
+    #[serde(default)]
+    pub max_displacement_relative_error: Option<f64>,
+    #[serde(default)]
+    pub mean_von_mises_relative_error: Option<f64>,
+    #[serde(default)]
+    pub max_sigma_xx_relative_error: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -885,6 +935,26 @@ pub struct TrainingDiagnostics {
     #[serde(default)]
     pub train_data_cap: usize,
     #[serde(default)]
+    pub training_mode: String,
+    #[serde(default)]
+    pub benchmark_id: Option<String>,
+    #[serde(default)]
+    pub gate_status: String,
+    #[serde(default)]
+    pub certified_best_metric: f64,
+    #[serde(default)]
+    pub reproducibility_spread: Option<f64>,
+    #[serde(default)]
+    pub dominant_blocker: Option<String>,
+    #[serde(default)]
+    pub stalled_reason: Option<String>,
+    #[serde(default)]
+    pub benchmark_certification: Option<BenchmarkCertification>,
+    #[serde(default)]
+    pub run_budget_used: usize,
+    #[serde(default)]
+    pub run_budget_total: usize,
+    #[serde(default)]
     pub recent_events: Vec<String>,
     #[serde(default)]
     pub pino: Option<PinoRuntimeMetadata>,
@@ -948,6 +1018,22 @@ pub struct TrainResult {
     pub stop_reason: String,
     pub notes: Vec<String>,
     #[serde(default)]
+    pub training_mode: Option<String>,
+    #[serde(default)]
+    pub benchmark_id: Option<String>,
+    #[serde(default)]
+    pub gate_status: Option<String>,
+    #[serde(default)]
+    pub certified_best_metric: Option<f64>,
+    #[serde(default)]
+    pub reproducibility_spread: Option<f64>,
+    #[serde(default)]
+    pub dominant_blocker: Option<String>,
+    #[serde(default)]
+    pub stalled_reason: Option<String>,
+    #[serde(default)]
+    pub benchmark_certification: Option<BenchmarkCertification>,
+    #[serde(default)]
     pub pino: Option<PinoRuntimeMetadata>,
 }
 
@@ -1008,6 +1094,22 @@ pub struct RuntimeFingerprint {
     pub debug_build: bool,
     pub git_commit: String,
     pub build_time_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingBenchmarkManifest {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub training_mode: String,
+    pub analysis_type: String,
+    pub gate_name: String,
+    pub gate_target_loss: f64,
+    pub recommended_learning_rate: f64,
+    pub max_runtime_seconds: usize,
+    pub recommended_epochs: usize,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

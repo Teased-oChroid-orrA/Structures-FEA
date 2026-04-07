@@ -27,6 +27,7 @@
     "train:headless:adaptive": "bash scripts/run-headless-training.sh adaptive",
     "train:headless:default-1e9": "bash scripts/run-headless-training.sh default-1e9",
     "train:headless:default-1e9-fast": "bash scripts/run-headless-training.sh default-1e9-fast",
+    "train:headless:benchmark-cantilever-fast": "bash scripts/run-headless-training.sh benchmark-cantilever-fast",
     "train:headless:default-1e9:release": "HEADLESS_RELEASE=1 bash scripts/run-headless-training.sh default-1e9",
     "train:headless:exact-ui": "bash scripts/run-headless-training.sh exact-ui",
     "tauri:dev": "tauri dev",

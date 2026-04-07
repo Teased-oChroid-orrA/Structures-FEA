@@ -20,6 +20,7 @@
     setSafeguardSettings,
     getTrainingTick,
     getTrainingProgress,
+    listTrainingBenchmarks,
     saveTrainingCheckpoint,
     listTrainingCheckpoints,
     resumeTrainingFromCheckpoint,
@@ -47,6 +48,7 @@
     TrainResult,
     RuntimeFingerprint,
     ModelStatus,
+    TrainingBenchmarkManifest,
     SafeguardSettings,
     ResumeTrainingResult
   } from '$lib/types/contracts';
@@ -104,6 +106,9 @@
   let trainEpochs = $state(40);
   let trainTarget = $state(1e-9);
   let trainLr = $state(0.0005);
+  let trainTrainingMode = $state<'benchmark' | 'legacy-mixed-exact' | 'production-generalized'>('benchmark');
+  let trainBenchmarkId = $state('benchmark_cantilever_2d');
+  let trainingBenchmarks = $state<TrainingBenchmarkManifest[]>([]);
   let trainAnalysisType = $state<'general' | 'cantilever' | 'plate-hole'>('cantilever');
   let trainAutoMode = $state<'true' | 'false'>('true');
   let trainMaxEpochs = $state(10000);
@@ -331,6 +336,17 @@
   const autoTrainingRecipe = $derived.by(() =>
     buildAutoTrainingRecipe(solveInput, trainAnalysisType, trainAutoRecipe === 'true')
   );
+  const selectedTrainingBenchmark = $derived.by(
+    () => trainingBenchmarks.find((benchmark) => benchmark.id === trainBenchmarkId) ?? null
+  );
+
+  const benchmarkCertification = $derived.by(
+    () =>
+      trainingStatus?.diagnostics?.benchmarkCertification ??
+      trainingStatus?.lastResult?.benchmarkCertification ??
+      lastTrainResult?.benchmarkCertification ??
+      null
+  );
 
   let exportPath = $state('outputs/fea_report.json');
   let exportFormat = $state<'json' | 'csv' | 'pdf'>('json');
@@ -447,8 +463,8 @@
       status: trainingActive ? trainingPhaseLabel : 'idle',
       epoch: finiteOr(t?.epoch, 0),
       totalEpochs: finiteOr(t?.totalEpochs, displayTotalEpochs),
-      loss: finiteOr(t?.loss, 0),
-      valLoss: finiteOr(t?.valLoss, 0),
+      loss: finiteOr(p?.loss, finiteOr(t?.loss, 0)),
+      valLoss: finiteOr(p?.valLoss, finiteOr(t?.valLoss, 0)),
       valDataLoss: finiteOr(p?.valDataLoss, 0),
       valPhysicsLoss: finiteOr(p?.valPhysicsLoss, 0),
       learningRate: finiteOr(t?.learningRate, trainLr),
@@ -463,19 +479,40 @@
   });
   const displayEpochsSinceImprovement = $derived.by(() => {
     if (!trainingActive && !lastTrainResult) return 0;
-    return Math.max(0, trainingStatus?.diagnostics?.epochsSinceImprovement ?? 0);
+    const diagnosticsValue = Math.max(0, trainingStatus?.diagnostics?.epochsSinceImprovement ?? 0);
+    const completedEpochCap = Math.max(
+      trainingTick?.epoch ?? 0,
+      trainingProgress?.epoch ?? 0,
+      lastTrainResult?.completedEpochs ?? 0,
+      displayEpoch
+    );
+    if (trainingActive && completedEpochCap === 0) return 0;
+    return Math.min(diagnosticsValue, completedEpochCap);
   });
   const latestObservedLoss = $derived.by(() => {
     const candidates = [
       trainingProgress?.valLoss,
-      trainingTick?.valLoss,
-      lastTrainResult?.valLoss,
       trainingProgress?.loss,
+      trainingTick?.valLoss,
       trainingTick?.loss,
+      lastTrainResult?.valLoss,
       lastTrainResult?.loss
     ];
     for (const value of candidates) {
       if (Number.isFinite(value ?? NaN)) return value as number;
+    }
+    return null;
+  });
+  const displayCurrentValLoss = $derived.by(() => {
+    const candidates = [
+      trainingProgress?.valLoss,
+      trainingProgress?.loss,
+      trainingTick?.valLoss,
+      trainingTick?.loss,
+      lastTrainResult?.valLoss
+    ];
+    for (const value of candidates) {
+      if (Number.isFinite(value ?? NaN) && (value as number) > 0) return value as number;
     }
     return null;
   });
@@ -937,6 +974,13 @@
           await onModelStatus();
           return true;
         }, 1500, false);
+        trainingBenchmarks = await startupTimeout(() => listTrainingBenchmarks(), 1500, []);
+        if (trainTrainingMode === 'benchmark' && trainingBenchmarks.length > 0) {
+          if (!trainingBenchmarks.some((benchmark) => benchmark.id === trainBenchmarkId)) {
+            trainBenchmarkId = trainingBenchmarks[0]?.id ?? trainBenchmarkId;
+          }
+          onApplyBenchmarkPreset();
+        }
         runtimeKind = getRuntimeKind();
         runtimeFingerprint = await startupTimeout(() => getRuntimeFingerprint(), 1500, null);
         trainingStatus = await startupTimeout(() => getTrainingStatus(), 1500, null);
@@ -1125,6 +1169,10 @@
     trainingHistory = [];
     lastHistoryEpoch = 0;
     trainingProgress = null;
+    if (trainTrainingMode === 'benchmark' && !selectedTrainingBenchmark) {
+      err = 'Select a benchmark profile before starting benchmark-mode training.';
+      return;
+    }
     const trainingCases =
       trainAutoRecipe === 'true'
         ? autoTrainingRecipe.seedCases.map((c) => toPlainSolveInput(c))
@@ -1133,6 +1181,8 @@
       cases: trainingCases,
       epochs: trainEpochs,
       targetLoss: trainTarget,
+      trainingMode: trainTrainingMode,
+      benchmarkId: trainTrainingMode === 'benchmark' ? trainBenchmarkId : undefined,
       learningRate: trainLr,
       analysisType: trainAnalysisType,
       autoMode: trainAutoMode === 'true',
@@ -1442,6 +1492,27 @@
       await onListCheckpoints();
     }
   }
+
+  function onApplyBenchmarkPreset() {
+    if (!selectedTrainingBenchmark) return;
+    trainTrainingMode = 'benchmark';
+    trainAnalysisType = selectedTrainingBenchmark.analysisType as 'general' | 'cantilever' | 'plate-hole';
+    trainTarget = selectedTrainingBenchmark.gateTargetLoss;
+    trainLr = selectedTrainingBenchmark.recommendedLearningRate;
+    trainEpochs = selectedTrainingBenchmark.recommendedEpochs;
+    trainMaxEpochs = selectedTrainingBenchmark.recommendedEpochs;
+    trainAutoRecipe = 'false';
+    trainOnlineActiveLearning = 'false';
+    trainAutonomousMode = 'true';
+    trainAutoMode = 'true';
+    if (selectedTrainingBenchmark.analysisType === 'cantilever') {
+      trainCurriculumPreset = 'cantilever-data-first';
+    } else if (selectedTrainingBenchmark.analysisType === 'plate-hole') {
+      trainCurriculumPreset = 'plate-hole-balanced';
+    } else {
+      trainCurriculumPreset = 'contact-stabilized';
+    }
+  }
 </script>
 
 <main>
@@ -1596,8 +1667,8 @@
                   </span>
                   <span class="chip">
                     val loss:
-                    {#if trainingTick && trainingTick.valLoss > 0}
-                      <NumberFlow value={trainingTick.valLoss} format={{ maximumSignificantDigits: 4 }} />
+                    {#if displayCurrentValLoss !== null}
+                      <NumberFlow value={displayCurrentValLoss} format={{ maximumSignificantDigits: 4 }} />
                     {:else if trainingActive}
                       estimating...
                     {:else}
@@ -1663,6 +1734,15 @@
                   <div class="meta" style="margin-top:0.3rem;">live validation must cross this threshold before the run is called converged</div>
                 </article>
                 <article class="stat">
+                  <div class="label">Gate Status</div>
+                  <div class="value">
+                    {trainingStatus?.diagnostics?.gateStatus ?? trainingProgress?.gateStatus ?? 'queued'}
+                  </div>
+                  <div class="meta" style="margin-top:0.3rem;">
+                    {trainingStatus?.diagnostics?.benchmarkId ?? trainingProgress?.benchmarkId ?? trainBenchmarkId}
+                  </div>
+                </article>
+                <article class="stat">
                   <div class="label">Observed Gap</div>
                   <div class="value">
                     {#if targetLossGap !== null}
@@ -1672,6 +1752,42 @@
                     {/if}
                   </div>
                   <div class="meta" style="margin-top:0.3rem;">latest observed loss minus the target loss</div>
+                </article>
+                <article class="stat">
+                  <div class="label">Certified Best</div>
+                  <div class="value">
+                    {#if (trainingStatus?.diagnostics?.certifiedBestMetric ?? trainingProgress?.certifiedBestMetric) && (trainingStatus?.diagnostics?.certifiedBestMetric ?? trainingProgress?.certifiedBestMetric ?? Number.MAX_VALUE) < Number.MAX_VALUE}
+                      <NumberFlow value={trainingStatus?.diagnostics?.certifiedBestMetric ?? trainingProgress?.certifiedBestMetric ?? 0} format={{ maximumSignificantDigits: 6 }} />
+                    {:else}
+                      -
+                    {/if}
+                  </div>
+                  <div class="meta" style="margin-top:0.3rem;">
+                    blocker: {trainingStatus?.diagnostics?.dominantBlocker ?? trainingProgress?.dominantBlocker ?? 'n/a'}
+                  </div>
+                </article>
+                <article class="stat">
+                  <div class="label">Certification</div>
+                  <div class="value">{benchmarkCertification?.status ?? 'pending'}</div>
+                  <div class="meta" style="margin-top:0.3rem;">
+                    {#if benchmarkCertification}
+                      suggested target {benchmarkCertification.suggestedTargetLoss.toExponential(1)} · {benchmarkCertification.summary}
+                      {#if benchmarkCertification.tipDisplacementRelativeError != null}
+                        <br />
+                        tip/max-disp/vm/max-sxx:
+                        {' '}
+                        {benchmarkCertification.tipDisplacementRelativeError.toExponential(2)}
+                        /
+                        {benchmarkCertification.maxDisplacementRelativeError?.toExponential(2) ?? 'n/a'}
+                        /
+                        {benchmarkCertification.meanVonMisesRelativeError?.toExponential(2) ?? 'n/a'}
+                        /
+                        {benchmarkCertification.maxSigmaXxRelativeError?.toExponential(2) ?? 'n/a'}
+                      {/if}
+                    {:else}
+                      benchmark certification is emitted once the final benchmark floor is evaluated
+                    {/if}
+                  </div>
                 </article>
                 <article class="stat">
                   <div class="label">Progress Frames</div>
@@ -1850,6 +1966,10 @@
               <p>Keep this compact area for the settings you are likely to change often. Expert tuning stays below.</p>
             </div>
             <div class="kicker">
+              <span class="chip">{trainTrainingMode}</span>
+              {#if trainTrainingMode === 'benchmark' && selectedTrainingBenchmark}
+                <span class="chip ok">{selectedTrainingBenchmark.title}</span>
+              {/if}
               <span class="chip">{trainAnalysisType}</span>
               <span class="chip">target {trainTarget.toExponential(0)}</span>
               <span class="chip">{trainPinnBackend}</span>
@@ -1857,8 +1977,30 @@
           </div>
           <div class="field-grid">
             <label class="field">
+              <span>Training Mode</span>
+              <select bind:value={trainTrainingMode}>
+                <option value="benchmark">benchmark</option>
+                <option value="legacy-mixed-exact">legacy-mixed-exact</option>
+                <option value="production-generalized">production-generalized</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Benchmark Profile</span>
+              <select bind:value={trainBenchmarkId} disabled={trainTrainingMode !== 'benchmark'}>
+                {#each trainingBenchmarks as benchmark}
+                  <option value={benchmark.id}>{benchmark.title}</option>
+                {/each}
+              </select>
+            </label>
+            <label class="field">
+              <span>Apply Benchmark</span>
+              <button class="btn-primary" onclick={onApplyBenchmarkPreset} disabled={trainTrainingMode !== 'benchmark' || !selectedTrainingBenchmark}>
+                Apply Benchmark
+              </button>
+            </label>
+            <label class="field">
               <span>Analysis Type</span>
-              <select bind:value={trainAnalysisType}>
+              <select bind:value={trainAnalysisType} disabled={trainTrainingMode === 'benchmark'}>
                 <option value="general">general</option>
                 <option value="cantilever">cantilever</option>
                 <option value="plate-hole">plate-hole</option>
@@ -1921,6 +2063,23 @@
                 {trainAutoRecipe === 'true'
                   ? `App expands the current case into 3 training seeds and 2 validation cases, then grows to about ${autoTrainingRecipe.estimatedFemCases} lightweight FEM cases for the local recipe preview.`
                   : 'Training stays on the current case only; automatic expansion is disabled.'}
+              </div>
+            </article>
+            <article class="stat">
+              <div class="label">Benchmark Gate</div>
+              <div class="value">
+                {#if trainTrainingMode === 'benchmark' && selectedTrainingBenchmark}
+                  {selectedTrainingBenchmark.gateName}
+                {:else}
+                  custom
+                {/if}
+              </div>
+              <div class="meta" style="margin-top:0.3rem;">
+                {#if trainTrainingMode === 'benchmark' && selectedTrainingBenchmark}
+                  {selectedTrainingBenchmark.description}
+                {:else}
+                  Manual or legacy training path without a benchmark gate preset.
+                {/if}
               </div>
             </article>
             <article class="stat">

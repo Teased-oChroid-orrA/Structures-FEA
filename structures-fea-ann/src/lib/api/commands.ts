@@ -18,6 +18,7 @@ import type {
   SolveInput,
   ThermalInput,
   ThermalResult,
+  TrainingBenchmarkManifest,
   TrainResult,
   TrainingBatch,
   TrainingCheckpointInfo,
@@ -63,6 +64,64 @@ const mockState: MockState = {
   auditFrequency: 5,
   fallbackEnabled: true
 };
+
+const resolveMockTrainingMode = (batch?: TrainingBatch) =>
+  batch?.trainingMode ?? (batch?.benchmarkId ? 'benchmark' : 'legacy-mixed-exact');
+
+const mockTrainingBenchmarks: TrainingBenchmarkManifest[] = [
+  {
+    id: 'benchmark_bar_1d',
+    title: '1D Bar',
+    description: 'Displacement-primary axial bar sanity benchmark with exact closed-form response.',
+    trainingMode: 'benchmark',
+    analysisType: 'general',
+    gateName: 'Gate 1',
+    gateTargetLoss: 1e-3,
+    recommendedLearningRate: 5e-4,
+    maxRuntimeSeconds: 45,
+    recommendedEpochs: 256,
+    active: true
+  },
+  {
+    id: 'benchmark_cantilever_2d',
+    title: '2D Cantilever',
+    description: 'Isolated cantilever benchmark for exact displacement-primary convergence before harder families.',
+    trainingMode: 'benchmark',
+    analysisType: 'cantilever',
+    gateName: 'Gate 3',
+    gateTargetLoss: 1e-4,
+    recommendedLearningRate: 5e-4,
+    maxRuntimeSeconds: 180,
+    recommendedEpochs: 1024,
+    active: true
+  },
+  {
+    id: 'benchmark_patch_test_2d',
+    title: '2D Patch Test',
+    description: 'Linear elasticity patch test used to verify exact reproduction and residual consistency.',
+    trainingMode: 'benchmark',
+    analysisType: 'general',
+    gateName: 'Gate 4',
+    gateTargetLoss: 1e-4,
+    recommendedLearningRate: 4e-4,
+    maxRuntimeSeconds: 180,
+    recommendedEpochs: 1024,
+    active: true
+  },
+  {
+    id: 'benchmark_plate_hole_2d',
+    title: 'Plate With Hole',
+    description: 'Plate-with-hole benchmark promoted only after simpler benchmark gates are stable.',
+    trainingMode: 'benchmark',
+    analysisType: 'plate-hole',
+    gateName: 'Gate 4',
+    gateTargetLoss: 1e-2,
+    recommendedLearningRate: 3.5e-4,
+    maxRuntimeSeconds: 240,
+    recommendedEpochs: 1536,
+    active: true
+  }
+];
 
 let lastMockTick: TrainingTickEvent = {
   epoch: 0,
@@ -115,6 +174,12 @@ let lastMockProgress: TrainingProgressEvent = {
   learningRate: mockState.learningRate,
   architecture: [...mockState.architecture],
   progressRatio: 0,
+  trainingMode: 'legacy-mixed-exact',
+  benchmarkId: null,
+  gateStatus: 'queued',
+  certifiedBestMetric: Number.MAX_VALUE,
+  dominantBlocker: null,
+  stalledReason: null,
   network: { layerSizes: [], nodes: [], connections: [] }
 };
 let mockTrainingStatus: TrainingRunStatus = {
@@ -165,6 +230,15 @@ let mockTrainingStatus: TrainingRunStatus = {
     collocationSamplesAdded: 0,
     trainDataSize: 0,
     trainDataCap: 0,
+    trainingMode: 'legacy-mixed-exact',
+    benchmarkId: null,
+    gateStatus: 'queued',
+    certifiedBestMetric: Number.MAX_VALUE,
+    reproducibilitySpread: null,
+    dominantBlocker: null,
+    stalledReason: null,
+    runBudgetUsed: 0,
+    runBudgetTotal: 0,
     recentEvents: []
   }
 };
@@ -299,6 +373,8 @@ export const solveFemCase = (input: SolveInput) => {
 
 const runMockTrainingLoop = async (batch: TrainingBatch) => {
   if (mockTrainingStatus.running) return false;
+  const trainingMode = resolveMockTrainingMode(batch);
+  const benchmarkId = batch.benchmarkId ?? null;
 
   const epochs = Math.max(1, batch.epochs);
   const emitEvery = Math.max(1, batch.progressEmitEveryEpochs ?? 1);
@@ -328,7 +404,16 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
     diagnostics: {
       ...mockTrainingStatus.diagnostics,
       lrSchedulePhase: 'training',
-      currentLearningRate: mockState.learningRate
+      currentLearningRate: mockState.learningRate,
+      trainingMode,
+      benchmarkId,
+      gateStatus: 'running',
+      certifiedBestMetric: Number.MAX_VALUE,
+      reproducibilitySpread: null,
+      dominantBlocker: null,
+      stalledReason: null,
+      runBudgetUsed: 0,
+      runBudgetTotal: maxTotal
     }
   };
 
@@ -396,6 +481,13 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
       learningRate: mockState.learningRate,
       architecture: [...mockState.architecture],
       progressRatio: completed / maxTotal,
+      trainingMode,
+      benchmarkId,
+      gateStatus: 'running',
+      certifiedBestMetric: bestVal,
+      dominantBlocker:
+        valLoss * 0.34 >= valLoss * 0.3 ? 'val-stress-fit' : 'val-displacement-fit',
+      stalledReason: null,
       network: networkSnapshot()
     };
     const tick: TrainingTickEvent = {
@@ -450,6 +542,15 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
           collocationSamplesAdded: progress.collocationSamplesAdded,
           trainDataSize: progress.trainDataSize,
           trainDataCap: progress.trainDataCap,
+          trainingMode,
+          benchmarkId,
+          gateStatus: 'running',
+          certifiedBestMetric: bestVal,
+          reproducibilitySpread: null,
+          dominantBlocker: progress.dominantBlocker,
+          stalledReason: null,
+          runBudgetUsed: completed,
+          runBudgetTotal: maxTotal,
           recentEvents
         }
       };
@@ -481,7 +582,18 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
       : valLoss <= target
         ? 'target-loss-reached'
         : 'max-epochs-reached',
-    notes: ['Web preview mode: local mock trainer active.']
+    notes: ['Web preview mode: local mock trainer active.'],
+    trainingMode,
+    benchmarkId,
+    gateStatus: mockTrainingStatus.stopRequested
+      ? 'stopped'
+      : valLoss <= target
+        ? 'passed'
+        : 'failed',
+    certifiedBestMetric: bestVal,
+    reproducibilitySpread: null,
+    dominantBlocker: lastMockProgress.dominantBlocker ?? null,
+    stalledReason: null
   };
   mockTrainingStatus = {
     running: false,
@@ -493,7 +605,16 @@ const runMockTrainingLoop = async (batch: TrainingBatch) => {
       bestValLoss: Math.min(mockTrainingStatus.diagnostics.bestValLoss, result.valLoss),
       currentLearningRate: result.learningRate,
       lrSchedulePhase: result.stopReason,
-      boSelectedArchitecture: [...result.architecture]
+      boSelectedArchitecture: [...result.architecture],
+      trainingMode,
+      benchmarkId,
+      gateStatus: result.gateStatus ?? 'failed',
+      certifiedBestMetric: result.certifiedBestMetric ?? result.valLoss,
+      reproducibilitySpread: null,
+      dominantBlocker: result.dominantBlocker ?? null,
+      stalledReason: result.stalledReason ?? null,
+      runBudgetUsed: completed,
+      runBudgetTotal: maxTotal
     }
   };
   emitMock('ann-training-complete', result);
@@ -512,6 +633,13 @@ export const stopAnnTraining = async () => {
     return true;
   }
   return false;
+};
+
+export const listTrainingBenchmarks = () => {
+  if (isTauriRuntime()) {
+    return invoke<TrainingBenchmarkManifest[]>('list_training_benchmarks_command');
+  }
+  return Promise.resolve(mockTrainingBenchmarks);
 };
 
 export const getTrainingStatus = () => {
